@@ -1,0 +1,2000 @@
+diff --git a/docs/notify.md b/docs/notify.md
+new file mode 100644
+index 0000000..880d24c
+--- /dev/null
++++ b/docs/notify.md
+@@ -0,0 +1,94 @@
++# Asynchronous Voice Notifications
++
++The `notify` message lets the cloud play a one-way voice notification while a device is idle. It does not open a conversation audio channel and never enables microphone uplink. Starting a conversation still requires an explicit wake action from the user.
++
++## Message format
++
++The cloud sends the following JSON through the device's current protocol control connection. For an
++MQTT device, this is the existing MQTT control topic:
++
++```json
++{
++  "type": "notify",
++  "audio_url": "https://cdn.example.com/audio/task-complete.ogg",
++  "subtitles": [
++    {
++      "start_ms": 0,
++      "text": "Your task is complete."
++    },
++    {
++      "start_ms": 1800,
++      "text": "The result has been saved."
++    }
++  ]
++}
++```
++
++`audio_url` is required. Both `http://` and `https://` URLs are accepted. HTTP is useful for local-network development, while production deployments can enforce HTTPS when generating the URL.
++
++`subtitles` is optional. Each entry contains the media start time in milliseconds and the text to display. The device sorts entries by `start_ms` and updates the display only when playback crosses a new subtitle entry.
++
++The message has no acknowledgement, notification ID, state, kind, or expiry field. Delivery is best effort and only applies to online devices.
++
++## Audio response
++
++`audio_url` must return a successful 2xx response containing a single-stream, mono Ogg Opus file. Responses with either `Content-Length` or chunked transfer encoding are supported. Redirects are not followed by the device.
++
++The file is read incrementally. The device does not allocate memory based on the complete response length and does not download the complete file before playback. Notification streaming uses the existing bounded HTTP response queue, a 2 KB Ogg logical-packet buffer, the shared 20-packet Opus decode queue, and the existing two-frame PCM playback queue. The decode queue represents 1.2 seconds at the firmware's normal 60 ms packet duration. These buffers provide TCP backpressure while keeping the feature usable on devices without PSRAM.
++
++On devices that use the standalone LiteAudioEngine WakeNet, WakeNet resources are released while a notification is playing and recreated when the device returns to `Idle`. AFE-based devices keep their existing local wake behavior.
++
++Opus packet duration is read from the Opus TOC byte instead of being supplied in the MQTT message. Integer packet durations from 5 ms through 120 ms that are supported by the firmware decoder are accepted. The current implementation rejects stereo streams, detected Ogg or Opus structural errors, incomplete streams, oversized logical packets, and 2.5 ms packets.
++
++## Device behavior
++
++The device accepts `notify` only while it is in `Idle`. It then performs the following actions:
++
++1. Enters the internal `Notifying` state and switches the board to performance mode.
++2. Disables normal voice processing and microphone uplink.
++3. Clears previous playback and queues the built-in popup sound.
++4. Starts one HTTP GET in a background task.
++5. Incrementally demultiplexes Ogg packets and sends them directly to the existing Opus decode queue.
++6. Displays subtitles according to the media position of Opus packets reaching the audio output task.
++7. Returns to `Idle` only after the HTTP stream has ended successfully and all queued audio has played.
++
++The popup is queued before the HTTP task starts, so remote audio cannot play before it. HTTP connection setup still overlaps the actual popup playback.
++
++If all playback queues drain after remote audio has started but before the HTTP stream has finished,
++the device logs `Notification playback underrun #<count> at <position> ms`. The popup-to-stream
++transition and normal end of playback are not reported as underruns.
++
++The device does not open the UDP audio channel, send `start-listening`, or automatically enter `Listening`. AFE-based devices may continue local wake-word detection during playback. Devices without playback echo cancellation retain the existing speaking-mode wake behavior; hardware wake controls can still cancel a notification.
++
++A wake action cancels the HTTP producer, clears queued notification audio, and continues through the normal wake flow. Network loss, HTTP errors, and invalid audio also cancel playback and return the device to `Idle`. A second notification received while the device is busy is ignored.
++
++## xz-mqtt forwarding
++
++`xz-mqtt` forwards the message with its existing Redis RPC method:
++
++```json
++{
++  "method": "forward",
++  "clientId": "device-client-id",
++  "params": {
++    "type": "notify",
++    "audio_url": "https://cdn.example.com/audio/task-complete.ogg",
++    "subtitles": [
++      {
++        "start_ms": 0,
++        "text": "Your task is complete."
++      }
++    ]
++  }
++}
++```
++
++The RPC result contains the boolean returned by the MQTT send operation:
++
++```json
++{
++  "success": true
++}
++```
++
++This result means that `xz-mqtt` wrote the publish message to the current online device connection. It does not confirm receipt or playback. `xz-mqtt` does not create a UDP session, start the chat bridge, proxy the Ogg file, or retain notifications for offline devices.
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index ebb2139..24d8d53 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ set(SOURCES "audio/audio_codec.cc"
+             "audio/audio_service.cc"
+             "audio/demuxer/ogg_demuxer.cc"
++            "notify/notify_player.cc"
+             "audio/codecs/no_audio_codec.cc"
+             "audio/codecs/box_audio_codec.cc"
+             "audio/codecs/es8311_audio_codec.cc"
+diff --git a/main/application.cc b/main/application.cc
+index 3b6f07e..14bc97d 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -9,6 +9,7 @@
+ #include "mcp_server.h"
+ #include "assets.h"
+ #include "settings.h"
++#include <assets/assets.h>  // StackChan: OGG_NEW_NOTIFICATION 叮咚提示音
+ 
+ #include <cstring>
+ #include <esp_log.h>
+@@ -16,11 +17,12 @@
+ #include <driver/gpio.h>
+ #include <arpa/inet.h>
+ #include <font_awesome.h>
++#include <limits>
+ 
+ #define TAG "Application"
+ 
+ 
+-Application::Application() {
++Application::Application() : notify_player_(audio_service_) {
+     event_group_ = xEventGroupCreate();
+ 
+ #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
+@@ -47,6 +49,7 @@ Application::Application() {
+ }
+ 
+ Application::~Application() {
++    notify_player_.Stop();
+     if (clock_timer_handle_ != nullptr) {
+         esp_timer_stop(clock_timer_handle_);
+         esp_timer_delete(clock_timer_handle_);
+@@ -83,6 +86,12 @@ void Application::Initialize() {
+     callbacks.on_vad_change = [this](bool speaking) {
+         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+     };
++    callbacks.on_playback_drained = [this]() {
++        xEventGroupSetBits(event_group_, MAIN_EVENT_PLAYBACK_DRAINED);
++    };
++    callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
++        notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
++    };
+     audio_service_.SetCallbacks(callbacks);
+ 
+     // Add state change listeners
+@@ -185,6 +194,9 @@ void Application::Run() {
+         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+ 
+         if (bits & MAIN_EVENT_ERROR) {
++            if (GetDeviceState() == kDeviceStateNotifying) {
++                StopNotification();
++            }
+             SetDeviceState(kDeviceStateIdle);
+             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+         }
+@@ -205,6 +217,17 @@ void Application::Run() {
+             HandleStateChangedEvent();
+         }
+ 
++        if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
++            if (audio_service_.IsPlaybackIdle()) {
++                notify_player_.OnPlaybackDrained();
++            }
++            // StackChan (v1.9.12): 插播后的"恢复监听"不放这里——通道刚关闭时
++            // 音频管线 drain 也会触发本事件，会抢在 notify 还没开始播之前就
++            // 误重开会话（实测 PlayNotifyUrl rejected，播报只剩叮咚）。
++            // 改由 HandleNotificationFinished（notify 播完）和
++            // OnBroadcastFallbackFinished（兜底叮咚放完）确定性触发。
++        }
++
+         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
+             HandleToggleChatEvent();
+         }
+@@ -286,7 +309,11 @@ void Application::HandleNetworkConnectedEvent() {
+ void Application::HandleNetworkDisconnectedEvent() {
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+-    if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
++    if (state == kDeviceStateNotifying) {
++        StopNotification();
++    }
++    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
++        state == kDeviceStateSpeaking) {
+         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
+         protocol_->CloseAudioChannel();
+     }
+@@ -514,14 +541,94 @@ void Application::InitializeProtocol() {
+         Schedule([this]() {
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
++            auto state_before_close = GetDeviceState();
+             SetDeviceState(kDeviceStateIdle);
++
++            // StackChan (v1.9.12): 播报插播——通道因插播而关闭时，此刻状态已是
++            // idle（notify 引擎要求），直接把文本交给播放器（TTS 任务队列）。
++            // 播完由 PLAYBACK_DRAINED 分支负责恢复连续对话。
++            if (!broadcast_text_.empty()) {
++                std::string text = std::move(broadcast_text_);
++                broadcast_text_.clear();
++                user_exit_requested_ = false;  // 插播的"退出意图"已消费
++                bool queued = broadcast_player_ && broadcast_player_(text);
++                if (!queued) {
++                    broadcast_resume_after_ = false;  // 没播成就不用恢复了
++                }
++                ESP_LOGI(TAG, "Channel closed for broadcast playback (queued=%d, resume=%d)",
++                         (int)queued, (int)broadcast_resume_after_);
++                return;
++            }
++
++            // StackChan (v1.9.10): 连续对话保持。
++            // 实测服务器（api.tenclass.net）经常在回答结束后立刻 goodbye，
++            // 设备被迫回 idle，用户必须重新喊唤醒词——体验极差。
++            // 若是服务器主动断开（非用户点屏幕/语音"退下"），且当时处于
++            // 连续对话模式，则自动重开音频通道继续聆听。
++            if (user_exit_requested_) {
++                user_exit_requested_ = false;
++                auto_reopen_count_ = 0;
++                ESP_LOGI(TAG, "User requested exit, staying idle");
++                return;
++            }
++            // v1.9.11: Listening 与 Speaking 都算"对话中"——服务器 goodbye
++            // 可能在回答音频还在收尾时就到达（state 还是 Speaking）
++            if ((state_before_close == kDeviceStateListening ||
++                 state_before_close == kDeviceStateSpeaking) &&
++                listening_mode_ != kListeningModeManualStop &&
++                auto_reopen_count_ < kMaxAutoReopens) {
++                auto_reopen_count_++;
++                ESP_LOGI(TAG, "Server closed session after answer, auto reopening audio channel (%lu/%lu)",
++                         (unsigned long)auto_reopen_count_, (unsigned long)kMaxAutoReopens);
++                SetDeviceState(kDeviceStateConnecting);
++                Schedule([this]() {
++                    ContinueOpenAudioChannel(GetDefaultListeningMode());
++                });
++            }
+         });
+     });
+     
+     protocol_->OnIncomingJson([this, display](const cJSON* root) {
+         // Parse JSON data
+         auto type = cJSON_GetObjectItem(root, "type");
+-        if (strcmp(type->valuestring, "tts") == 0) {
++        if (!cJSON_IsString(type)) {
++            ESP_LOGW(TAG, "Incoming JSON message has no type");
++            return;
++        }
++        if (strcmp(type->valuestring, "notify") == 0) {
++            auto audio_url = cJSON_GetObjectItem(root, "audio_url");
++            if (!cJSON_IsString(audio_url) || audio_url->valuestring[0] == '\0') {
++                ESP_LOGW(TAG, "Notify message requires audio_url");
++                return;
++            }
++
++            std::vector<NotifySubtitle> subtitles;
++            auto subtitles_json = cJSON_GetObjectItem(root, "subtitles");
++            if (subtitles_json != nullptr && !cJSON_IsArray(subtitles_json)) {
++                ESP_LOGW(TAG, "Notify subtitles must be an array");
++                return;
++            }
++            if (cJSON_IsArray(subtitles_json)) {
++                cJSON* item = nullptr;
++                cJSON_ArrayForEach (item, subtitles_json) {
++                    auto start_ms = cJSON_GetObjectItem(item, "start_ms");
++                    auto text = cJSON_GetObjectItem(item, "text");
++                    if (!cJSON_IsNumber(start_ms) || start_ms->valuedouble < 0 ||
++                        start_ms->valuedouble > std::numeric_limits<uint32_t>::max() ||
++                        !cJSON_IsString(text)) {
++                        ESP_LOGW(TAG, "Ignoring invalid notify subtitle");
++                        continue;
++                    }
++                    subtitles.push_back({.start_ms = static_cast<uint32_t>(start_ms->valuedouble),
++                                         .text = text->valuestring});
++                }
++            }
++
++            Schedule([this, url = std::string(audio_url->valuestring),
++                      subtitles = std::move(subtitles)]() mutable {
++                StartNotification(std::move(url), std::move(subtitles));
++            });
++        } else if (strcmp(type->valuestring, "tts") == 0) {
+             auto state = cJSON_GetObjectItem(root, "state");
+             if (strcmp(state->valuestring, "start") == 0) {
+                 Schedule([this]() {
+@@ -676,7 +783,12 @@ void Application::StopListening() {
+ 
+ void Application::HandleToggleChatEvent() {
+     auto state = GetDeviceState();
+-    
++
++    if (state == kDeviceStateNotifying) {
++        StopNotification();
++        state = kDeviceStateIdle;
++    }
++
+     if (state == kDeviceStateActivating) {
+         SetDeviceState(kDeviceStateIdle);
+         return;
+@@ -709,6 +821,11 @@ void Application::HandleToggleChatEvent() {
+     } else if (state == kDeviceStateSpeaking) {
+         AbortSpeaking(kAbortReasonNone);
+     } else if (state == kDeviceStateListening) {
++        // StackChan (v1.9.10): 点屏幕退出 = 用户主动结束，不触发自动重开
++        // StackChan (v1.9.12): 用户意图优先，取消待插播的"播完恢复"
++        broadcast_text_.clear();
++        broadcast_resume_after_ = false;
++        user_exit_requested_ = true;
+         protocol_->CloseAudioChannel();
+     }
+ }
+@@ -730,7 +847,12 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+ 
+ void Application::HandleStartListeningEvent() {
+     auto state = GetDeviceState();
+-    
++
++    if (state == kDeviceStateNotifying) {
++        StopNotification();
++        state = kDeviceStateIdle;
++    }
++
+     if (state == kDeviceStateActivating) {
+         SetDeviceState(kDeviceStateIdle);
+         return;
+@@ -763,8 +885,13 @@ void Application::HandleStartListeningEvent() {
+ 
+ void Application::HandleStopListeningEvent() {
+     auto state = GetDeviceState();
+-    
+-    if (state == kDeviceStateAudioTesting) {
++
++    if (state == kDeviceStateNotifying) {
++        // StackChan (v1.9.12): 手动停止播报 = 用户意图，取消"播完恢复监听"
++        broadcast_resume_after_ = false;
++        broadcast_text_.clear();
++        StopNotification();
++    } else if (state == kDeviceStateAudioTesting) {
+         audio_service_.EnableAudioTesting(false);
+         SetDeviceState(kDeviceStateWifiConfiguring);
+         return;
+@@ -781,25 +908,56 @@ void Application::HandleWakeWordDetectedEvent() {
+         return;
+     }
+ 
++    // StackChan (v1.9.10): 用户主动唤醒 = 重新参与对话，恢复自动重开额度
++    auto_reopen_count_ = 0;
++
+     auto state = GetDeviceState();
+     auto wake_word = audio_service_.GetLastWakeWord();
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
+     if (state == kDeviceStateIdle) {
+         audio_service_.EncodeWakeWord();
+-        auto wake_word = audio_service_.GetLastWakeWord();
++        auto ww = audio_service_.GetLastWakeWord();
+ 
+         if (!protocol_->IsAudioChannelOpened()) {
+             SetDeviceState(kDeviceStateConnecting);
+             // Schedule to let the state change be processed first (UI update),
+             // then continue with OpenAudioChannel which may block for ~1 second
+-            Schedule([this, wake_word]() {
+-                ContinueWakeWordInvoke(wake_word);
++            Schedule([this, ww]() {
++                ContinueWakeWordInvoke(ww);
+             });
+             return;
+         }
+         // Channel already opened, continue directly
+-        ContinueWakeWordInvoke(wake_word);
++        ContinueWakeWordInvoke(ww);
++    } else if (state == kDeviceStateNotifying) {
++        // StackChan (v1.9.9): 播报期间/播报刚结束的唤醒必须处理！
++        // 此前 notifying 状态匹配不到任何分支，检测事件被静默吞掉，且 AFE
++        // 被这次检测"消耗"后不会重启——设备回到 idle 后也一直聋着，直到
++        // 下一次状态切换。这正是"播报完灯亮着却叫不醒"的根因。
++        // 正确做法：打断播报，走正常唤醒流程。
++        ESP_LOGI(TAG, "Wake word interrupts notification playback");
++        StopNotification();
++        // StackChan (v1.9.12): 用户唤醒打断插播 = 要说话，别再自动恢复监听
++        // （后面紧跟正常唤醒流程，会自己开会话；恢复标记留着会在播完后误重开）
++        broadcast_resume_after_ = false;
++        broadcast_text_.clear();
++        audio_service_.EncodeWakeWord();
++        auto ww = audio_service_.GetLastWakeWord();
++
++        if (!protocol_->IsAudioChannelOpened()) {
++            SetDeviceState(kDeviceStateConnecting);
++            Schedule([this, ww]() {
++                ContinueWakeWordInvoke(ww);
++            });
++            return;
++        }
++        ContinueWakeWordInvoke(ww);
++    } else if (state == kDeviceStateConnecting) {
++        // StackChan (v1.9.9): 建连期间的唤醒暂时无法加入会话（音频通道正在
++        // 打开，重复 open 会有竞态），但必须把 AFE 重新点亮，否则这次检测
++        // 会把唤醒词引擎"吃掉"，之后就一直唤不醒。
++        audio_service_.EnableWakeWordDetection(true);
+     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+         AbortSpeaking(kAbortReasonWakeWordDetected);
+         // Clear send queue to avoid sending residues to server
+@@ -877,6 +1035,10 @@ void Application::HandleStateChangedEvent() {
+             display->SetStatus(Lang::Strings::CONNECTING);
+             display->SetEmotion("neutral");
+             display->SetChatMessage("system", "");
++            // StackChan (v1.9.9): 建连期间保持 AFE 唤醒词在线。
++            // AFE（S3）带 AEC，可与建连/音频输出共存；否则这段窗口用户喊
++            // 唤醒词毫无反应，观感就是"死机"。
++            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+             break;
+         case kDeviceStateListening:
+             display->SetStatus(Lang::Strings::LISTENING);
+@@ -919,16 +1081,144 @@ void Application::HandleStateChangedEvent() {
+             }
+             audio_service_.ResetDecoder();
+             break;
++        case kDeviceStateNotifying:
++            display->SetStatus(Lang::Strings::SPEAKING);
++            audio_service_.EnableVoiceProcessing(false);
++            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++            break;
+         case kDeviceStateWifiConfiguring:
+             audio_service_.EnableVoiceProcessing(false);
+             audio_service_.EnableWakeWordDetection(false);
+             break;
++        case kDeviceStateActivating:
++            // StackChan (v1.9.9): 开机激活/OTA 检查阶段（屏幕常亮的"绿灯"窗口）
++            // 也启用唤醒词。此前这段时间 AFE 完全关闭，用户开机后喊破喉咙
++            // 也没反应，必须等激活结束进 idle 才能唤醒——体验很差。
++            // 激活期间 SRAM 充足（实测 ~45KB free），AFE 初始化无压力。
++            audio_service_.EnableVoiceProcessing(false);
++            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++            break;
+         default:
+             // Do nothing
+             break;
+     }
+ }
+ 
++bool Application::PlayNotifyUrl(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
++    if (audio_url.empty()) {
++        return false;
++    }
++    auto state = GetDeviceState();
++    if (state != kDeviceStateIdle || notify_player_.IsBusy()) {
++        return false;
++    }
++    Schedule([this, url = std::move(audio_url), subs = std::move(subtitles)]() mutable {
++        if (GetDeviceState() == kDeviceStateIdle) {
++            StartNotification(std::move(url), std::move(subs));
++        }
++    });
++    return true;
++}
++
++void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
++    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
++        ESP_LOGW(TAG, "Ignoring notify message while device is busy");
++        return;
++    }
++
++    auto& board = Board::GetInstance();
++    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++    audio_service_.EnableVoiceProcessing(false);
++    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++    audio_service_.ReleaseWakeWordResources();
++    while (audio_service_.PopPacketFromSendQueue()) {
++        // Discard microphone audio left over from a previous conversation.
++    }
++
++    if (!SetDeviceState(kDeviceStateNotifying)) {
++        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
++        return;
++    }
++
++    audio_service_.ResetDecoder();
++    uint32_t playback_id = ++notification_playback_id_;
++    if (playback_id == 0) {
++        playback_id = ++notification_playback_id_;
++    }
++    // StackChan (v1.9.9): 上游的 OGG_POPUP 只有 0.5 秒、声音偏轻，实测听感不明显。
++    // 换成 StackChan 自带的 new_notification.ogg（更清脆的"叮咚"，~1 秒），
++    // 用户要求：先叮咚提示，再开始播报。
++    audio_service_.PlaySound(OGG_NEW_NOTIFICATION);
++
++    bool started = notify_player_.Start(
++        std::move(audio_url), std::move(subtitles), playback_id,
++        [this](uint32_t id, const std::string& text) {
++            Schedule([this, id, text]() {
++                if (GetDeviceState() == kDeviceStateNotifying && notification_playback_id_ == id) {
++                    Board::GetInstance().GetDisplay()->SetChatMessage("assistant", text.c_str());
++                }
++            });
++        },
++        [this](uint32_t id, bool success) {
++            Schedule([this, id, success]() { HandleNotificationFinished(id, success); });
++        });
++
++    if (!started) {
++        ESP_LOGE(TAG, "Failed to start notification playback");
++        StopNotification();
++    }
++}
++
++void Application::StopNotification() {
++    notify_player_.Stop();
++    audio_service_.ResetDecoder();
++    // StackChan (v1.9.9): 无论退出播报后落到哪个状态，都把 AFE 唤醒词重新
++    // 点亮。SetDeviceState(idle) 的状态回调里也会 enable，但那依赖"状态真的
++    // 发生了切换"——若状态已被其他路径改走（如错误处理），回调不会触发，
++    // 唤醒词会静默失联。这里显式兜底，代价只是幂等地多调一次 Start。
++    audio_service_.EnableWakeWordDetection(true);
++    auto& board = Board::GetInstance();
++    board.GetDisplay()->SetChatMessage("assistant", "");
++    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
++    if (GetDeviceState() == kDeviceStateNotifying) {
++        SetDeviceState(kDeviceStateIdle);
++    }
++}
++
++void Application::HandleNotificationFinished(uint32_t playback_id, bool success) {
++    if (GetDeviceState() != kDeviceStateNotifying || notification_playback_id_ != playback_id) {
++        return;
++    }
++    ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
++             success ? "completed" : "failed");
++    StopNotification();
++    // StackChan (v1.9.12): 插播播完，恢复连续对话监听（仅自动连聊模式）。
++    // 注意不能放在 PLAYBACK_DRAINED 分支——通道关闭时的 drain 会抢在
++    // notify 开始前触发，导致过早重开、PlayNotifyUrl 被拒（实测踩坑）。
++    if (broadcast_resume_after_) {
++        broadcast_resume_after_ = false;
++        ESP_LOGI(TAG, "Broadcast finished, reopening audio channel for continuous listening");
++        SetDeviceState(kDeviceStateConnecting);
++        Schedule([this]() {
++            ContinueOpenAudioChannel(GetDefaultListeningMode());
++        });
++    }
++}
++
++void Application::OnBroadcastFallbackFinished() {
++    // StackChan (v1.9.12): 插播走了兜底叮咚（PlayNotifyUrl 被拒/拿 URL 失败），
++    // 叮咚放完后由 tts_worker 调用这里恢复连续对话监听。
++    if (!broadcast_resume_after_) {
++        return;
++    }
++    broadcast_resume_after_ = false;
++    ESP_LOGI(TAG, "Broadcast fallback finished, reopening audio channel for continuous listening");
++    SetDeviceState(kDeviceStateConnecting);
++    Schedule([this]() {
++        ContinueOpenAudioChannel(GetDefaultListeningMode());
++    });
++}
++
+ void Application::Schedule(std::function<void()>&& callback) {
+     {
+         std::lock_guard<std::mutex> lock(mutex_);
+@@ -938,7 +1228,10 @@ void Application::Schedule(std::function<void()>&& callback) {
+ }
+ 
+ void Application::AbortSpeaking(AbortReason reason) {
+-    ESP_LOGI(TAG, "Abort speaking");
++    // StackChan (v1.9.10): 带上原因与当前状态，排查"拍照结果被掐掉"类问题
++    // reason: 0=None(点屏幕/外部触发) 1=WakeWordDetected(语音唤醒打断)
++    ESP_LOGI(TAG, "Abort speaking reason=%d state=%s", (int)reason,
++             state_machine_.GetStateName(state_machine_.GetState()));
+     aborted_ = true;
+     if (protocol_) {
+         protocol_->SendAbortSpeaking(reason);
+@@ -956,6 +1249,9 @@ ListeningMode Application::GetDefaultListeningMode() const {
+ 
+ void Application::Reboot() {
+     ESP_LOGI(TAG, "Rebooting...");
++    if (GetDeviceState() == kDeviceStateNotifying) {
++        StopNotification();
++    }
+     // Disconnect the audio channel
+     if (protocol_ && protocol_->IsAudioChannelOpened()) {
+         protocol_->CloseAudioChannel();
+@@ -974,6 +1270,10 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
+     std::string upgrade_url = url;
+     std::string version_info = version.empty() ? "(Manual upgrade)" : version;
+ 
++    if (GetDeviceState() == kDeviceStateNotifying) {
++        StopNotification();
++    }
++
+     // Close audio channel if it's open
+     if (protocol_ && protocol_->IsAudioChannelOpened()) {
+         ESP_LOGI(TAG, "Closing audio channel before firmware upgrade");
+@@ -1039,6 +1339,13 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
+         }
+         // Channel already opened, continue directly
+         ContinueWakeWordInvoke(wake_word);
++    } else if (state == kDeviceStateNotifying) {
++        Schedule([this, wake_word]() {
++            if (GetDeviceState() == kDeviceStateNotifying) {
++                StopNotification();
++                WakeWordInvoke(wake_word);
++            }
++        });
+     } else if (state == kDeviceStateSpeaking) {
+         Schedule([this]() {
+             AbortSpeaking(kAbortReasonNone);
+@@ -1078,6 +1385,65 @@ void Application::SendMcpMessage(const std::string& payload) {
+     });
+ }
+ 
++void Application::RequestUserExit() {
++    // StackChan (v1.9.10): 用户主动退出连续对话（语音"退下"/MCP 工具）。
++    // 先置位退出标记，再关闭音频通道；通道关闭回调看到标记后保持 idle。
++    ESP_LOGI(TAG, "User exit requested (voice/screen), closing audio channel");
++    // StackChan (v1.9.12): 用户意图优先——若有待插播，放弃"播完恢复监听"
++    broadcast_text_.clear();
++    broadcast_resume_after_ = false;
++    user_exit_requested_ = true;
++    Schedule([this]() {
++        if (protocol_ && protocol_->IsAudioChannelOpened()) {
++            protocol_->CloseAudioChannel();
++        } else {
++            // 通道未开时也要回到 idle，保持状态一致
++            SetDeviceState(kDeviceStateIdle);
++        }
++    });
++}
++
++bool Application::RequestBroadcastPlayback(const std::string& text) {
++    // StackChan (v1.9.12): 播报插播。
++    // 空闲 → 直接交给播放器（TTS 任务队列），返回 true；
++    // 监听中 → 记下文本、退会话，通道关闭回调里再播，
++    //          播完由 PLAYBACK_DRAINED 分支恢复连续对话（仅自动连聊模式）；
++    // 其他状态（说话中/连接中/激活中/播报中）→ 返回 false，调用方下一轮再试。
++    if (text.empty() || !broadcast_player_) {
++        return false;
++    }
++    auto state = GetDeviceState();
++    if (state == kDeviceStateIdle) {
++        ESP_LOGI(TAG, "Broadcast requested while idle, playing now");
++        broadcast_player_(text);
++        return true;
++    }
++    if (state != kDeviceStateListening) {
++        ESP_LOGI(TAG, "Broadcast requested while %s, will retry later",
++                 state_machine_.GetStateName(state));
++        return false;
++    }
++    ESP_LOGI(TAG, "Broadcast requested while listening, exiting session to play");
++    broadcast_text_ = text;
++    broadcast_resume_after_ = (listening_mode_ != kListeningModeManualStop);
++    user_exit_requested_ = true;  // 阻止通道关闭回调里的自动重开
++    Schedule([this]() {
++        if (protocol_ && protocol_->IsAudioChannelOpened()) {
++            protocol_->CloseAudioChannel();
++        } else {
++            // 通道实际没开（罕见）：直接在主循环里播
++            SetDeviceState(kDeviceStateIdle);
++            std::string t = std::move(broadcast_text_);
++            broadcast_text_.clear();
++            user_exit_requested_ = false;
++            if (!broadcast_player_(t)) {
++                broadcast_resume_after_ = false;
++            }
++        }
++    });
++    return true;
++}
++
+ void Application::SetAecMode(AecMode mode) {
+     aec_mode_ = mode;
+     Schedule([this]() {
+@@ -1111,6 +1477,9 @@ void Application::PlaySound(const std::string_view& sound) {
+ 
+ void Application::ResetProtocol() {
+     Schedule([this]() {
++        if (GetDeviceState() == kDeviceStateNotifying) {
++            StopNotification();
++        }
+         // Close audio channel if opened
+         if (protocol_ && protocol_->IsAudioChannelOpened()) {
+             protocol_->CloseAudioChannel();
+diff --git a/main/application.h b/main/application.h
+index 7ca7af4..5120f3e 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -10,12 +10,16 @@
+ #include <mutex>
+ #include <deque>
+ #include <memory>
++#include <functional>
++#include <cstdint>
++#include <vector>
+ 
+ #include "protocol.h"
+ #include "ota.h"
+ #include "audio_service.h"
+ #include "device_state.h"
+ #include "device_state_machine.h"
++#include "notify/notify_player.h"
+ 
+ // Main event bits
+ #define MAIN_EVENT_SCHEDULE             (1 << 0)
+@@ -28,6 +32,12 @@
+ #define MAIN_EVENT_NETWORK_CONNECTED    (1 << 7)
+ #define MAIN_EVENT_NETWORK_DISCONNECTED (1 << 8)
+ #define MAIN_EVENT_TOGGLE_CHAT          (1 << 9)
++// StackChan (v1.9.11): 修复移植事故——此前 PLAYBACK_DRAINED 误用 (1<<10)，
++// 与 MAIN_EVENT_START_LISTENING 位冲突：每段音频播完都会幻影触发
++// HandleStartListeningEvent（打断播报 + 把模式改成 ManualStop），
++// 造成"拍照答案被掐 / 每轮答完必须重新唤醒 / 绿灯态听不见"。
++// 改用下一个空闲位 (1<<13)。
++#define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+ #define MAIN_EVENT_START_LISTENING      (1 << 10)
+ #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
+ #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+@@ -66,6 +76,13 @@ public:
+     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
+     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
+     
++    /**
++     * Stream-play a one-way voice notification from a URL (notify protocol).
++     * Safe on memory: uses the shared bounded decode queue, never loads the
++     * whole file. Only works while the device is idle; returns false otherwise.
++     */
++    bool PlayNotifyUrl(std::string audio_url, std::vector<NotifySubtitle> subtitles = {});
++
+     /**
+      * Request state transition
+      * Returns true if transition was successful
+@@ -112,7 +129,34 @@ public:
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
+-    
++
++    /**
++     * StackChan (v1.9.10): 用户主动退出连续对话（语音"退下"/MCP 工具调用）。
++     * 置位退出标记并关闭音频通道，服务器 goodbye 后不再自动重开。
++     */
++    void RequestUserExit();
++
++    /**
++     * StackChan (v1.9.12): 播报插播。空闲时直接交给播放器；监听中则退会话
++     * → 插播 → 播完自动恢复连续对话监听（仅连续对话模式）。
++     * 返回 false = 当前状态不适合插播（说话中/连接中），调用方下一轮再试。
++     */
++    bool RequestBroadcastPlayback(const std::string& text);
++
++    /**
++     * StackChan (v1.9.12): 注册播报播放器（hal_hermes 启动时调用，
++     * 把文本投递进 TTS 任务队列）。返回 false 表示投递失败。
++     */
++    void SetBroadcastPlayer(std::function<bool(const std::string&)> fn) {
++        broadcast_player_ = std::move(fn);
++    }
++
++    /**
++     * StackChan (v1.9.12): 插播走了兜底叮咚（TTS 任务里调用）。
++     * 叮咚放完后恢复连续对话监听（仅插播时置位过恢复标记才生效）。
++     */
++    void OnBroadcastFallbackFinished();
++
+     /**
+      * Reset protocol resources (thread-safe)
+      * Can be called from any task to release resources allocated after network connected
+@@ -134,6 +178,8 @@ private:
+     AecMode aec_mode_ = kAecOff;
+     std::string last_error_message_;
+     AudioService audio_service_;
++    NotifyPlayer notify_player_;
++    uint32_t notification_playback_id_ = 0;
+     std::unique_ptr<Ota> ota_;
+ 
+     bool has_server_time_ = false;
+@@ -143,6 +189,20 @@ private:
+     int clock_ticks_ = 0;
+     TaskHandle_t activation_task_handle_ = nullptr;
+ 
++    // StackChan (v1.9.10): 连续对话保持
++    // 服务器每轮回答后可能立即 goodbye 关闭会话，导致"答一轮就要重新喊唤醒词"。
++    // 此处记录用户主动退出意图与自动重开计数（防重连风暴），在通道关闭回调里
++    // 决定是否自动重开音频通道。
++    bool user_exit_requested_ = false;
++    uint32_t auto_reopen_count_ = 0;
++    static constexpr uint32_t kMaxAutoReopens = 5;
++
++    // StackChan (v1.9.12): 播报插播。监听中收到桥接播报时先记下文本并退会话，
++    // 通道关闭回调里交给播放器；notify 播完（或兜底音放完）后恢复连续对话。
++    std::string broadcast_text_;
++    bool broadcast_resume_after_ = false;
++    std::function<bool(const std::string&)> broadcast_player_;
++
+ 
+     // Event handlers
+     void HandleStateChangedEvent();
+@@ -155,6 +215,9 @@ private:
+     void HandleWakeWordDetectedEvent();
+     void ContinueOpenAudioChannel(ListeningMode mode);
+     void ContinueWakeWordInvoke(const std::string& wake_word);
++    void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
++    void StopNotification();
++    void HandleNotificationFinished(uint32_t playback_id, bool success);
+ 
+     // Activation task (runs in background)
+     void ActivationTask();
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..fb955fc 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -306,8 +306,34 @@ void AudioService::AudioOutputTask() {
+             codec_->EnableOutput(true);
+         }
+ 
++        if (task->playback_id != 0 && callbacks_.on_playback_progress) {
++            callbacks_.on_playback_progress(task->playback_id, task->media_position_ms);
++        }
++
+         codec_->OutputData(task->pcm);
+ 
++        // Fire the drained callback once after the last playback work for the
++        // current playback generation has been written to the codec.
++        lock.lock();
++        if (!playback_drained_notified_ && audio_decode_queue_.empty() && audio_playback_queue_.empty()) {
++            bool decode_in_flight = false;
++            for (const auto& pending : audio_encode_queue_) {
++                if (pending->type == kAudioTaskTypeDecodeToPlaybackQueue) {
++                    decode_in_flight = true;
++                    break;
++                }
++            }
++            if (!decode_in_flight) {
++                playback_drained_notified_ = true;
++                lock.unlock();
++                if (callbacks_.on_playback_drained) {
++                    callbacks_.on_playback_drained();
++                }
++                continue;
++            }
++        }
++        lock.unlock();
++
+         /* Update the last output time */
+         last_output_time_ = std::chrono::steady_clock::now();
+         debug_statistics_.playback_count++;
+@@ -346,6 +372,8 @@ void AudioService::OpusCodecTask() {
+             auto task = std::make_unique<AudioTask>();
+             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+             task->timestamp = packet->timestamp;
++            task->playback_id = packet->playback_id;
++            task->media_position_ms = packet->media_position_ms;
+ 
+             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+             if (opus_decoder_ != nullptr) {
+@@ -505,13 +533,22 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
+ 
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    const uint32_t generation = playback_generation_;
+     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+         if (wait) {
+-            audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
++            audio_queue_cv_.wait(lock, [this, generation]() {
++                return service_stopped_.load() ||
++                       generation != playback_generation_ ||
++                       audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
++            });
+         } else {
+             return false;
+         }
+     }
++    if (service_stopped_.load() || generation != playback_generation_) {
++        return false;
++    }
++    playback_drained_notified_ = false;
+     audio_decode_queue_.push_back(std::move(packet));
+     audio_queue_cv_.notify_all();
+     return true;
+@@ -576,6 +613,20 @@ void AudioService::EnableWakeWordDetection(bool enable) {
+     }
+ }
+ 
++void AudioService::ReleaseWakeWordResources() {
++#if !(CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31)
++    if (!audio_engine_initialized_) {
++        return;
++    }
++    if (xEventGroupGetBits(event_group_) &
++        (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
++        ESP_LOGW(TAG, "Cannot release WakeNet while the audio engine is active");
++        return;
++    }
++    static_cast<LiteAudioEngine*>(audio_engine_.get())->ReleaseWakeWordResources();
++#endif
++}
++
+ void AudioService::EnableVoiceProcessing(bool enable) {
+     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+     if (enable) {
+@@ -641,10 +692,10 @@ void AudioService::PlaySound(const std::string_view& ogg) {
+     size_t size = ogg.size();
+ 
+     auto demuxer = std::make_unique<OggDemuxer>();
+-    demuxer->OnDemuxerFinished([this](const uint8_t* data, int sample_rate, size_t size){
++    demuxer->OnPacket([this](const uint8_t* data, int sample_rate, int frame_duration_ms, size_t size){
+         auto packet = std::make_unique<AudioStreamPacket>();
+         packet->sample_rate = sample_rate;
+-        packet->frame_duration = 60;
++        packet->frame_duration = frame_duration_ms;
+         packet->payload.resize(size);
+         std::memcpy(packet->payload.data(), data, size);
+         PushPacketToDecodeQueue(std::move(packet), true);
+@@ -658,6 +709,20 @@ bool AudioService::IsIdle() {
+     return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+ }
+ 
++bool AudioService::IsPlaybackIdle() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    if (!audio_decode_queue_.empty() || !audio_playback_queue_.empty()) {
++        return false;
++    }
++    // A decode task may still be in flight inside the encode queue.
++    for (const auto& task : audio_encode_queue_) {
++        if (task->type == kAudioTaskTypeDecodeToPlaybackQueue) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ void AudioService::WaitForPlaybackQueueEmpty() {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+     audio_queue_cv_.wait(lock, [this]() { 
+@@ -676,6 +741,10 @@ void AudioService::ResetDecoder() {
+     audio_decode_queue_.clear();
+     audio_playback_queue_.clear();
+     audio_testing_queue_.clear();
++    // Wake any producer blocked in PushPacketToDecodeQueue(wait=true) and
++    // make it drop the packet it was holding (notify cancellation path).
++    playback_generation_++;
++    playback_drained_notified_ = true;
+     audio_queue_cv_.notify_all();
+ }
+ 
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index 99db546..8a2a024 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -3,6 +3,7 @@
+ 
+ #include <memory>
+ #include <deque>
++#include <atomic>
+ #include <condition_variable>
+ #include <chrono>
+ #include <mutex>
+@@ -39,7 +40,7 @@
+ #define OPUS_FRAME_DURATION_MS 60
+ #define MAX_ENCODE_TASKS_IN_QUEUE 2
+ #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+-#define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
++#define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
+ #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define AUDIO_TESTING_MAX_DURATION_MS 10000
+ #define MAX_TIMESTAMPS_IN_QUEUE 3
+@@ -80,6 +81,9 @@ struct AudioServiceCallbacks {
+     std::function<void(const std::string&)> on_wake_word_detected;
+     std::function<void(bool)> on_vad_change;
+     std::function<void(void)> on_audio_testing_queue_full;
++    // Fired when the decode/playback queues and their in-flight work are drained.
++    std::function<void(void)> on_playback_drained;
++    std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+ };
+ 
+ 
+@@ -92,7 +96,9 @@ enum AudioTaskType {
+ struct AudioTask {
+     AudioTaskType type;
+     std::vector<int16_t> pcm;
+-    uint32_t timestamp;
++    uint32_t timestamp = 0;
++    uint32_t playback_id = 0;
++    uint32_t media_position_ms = 0;
+ };
+ 
+ struct DebugStatistics {
+@@ -115,12 +121,14 @@ public:
+     const std::string& GetLastWakeWord() const;
+     bool IsVoiceDetected() const { return voice_detected_; }
+     bool IsIdle();
++    bool IsPlaybackIdle();
+     void WaitForPlaybackQueueEmpty();
+     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
+     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
+     bool IsAfeWakeWord();
+ 
+     void EnableWakeWordDetection(bool enable);
++    void ReleaseWakeWordResources();
+     void EnableVoiceProcessing(bool enable);
+     void EnableAudioTesting(bool enable);
+     void EnableDeviceAec(bool enable);
+@@ -177,9 +185,14 @@ private:
+     bool wake_word_initialized_ = false;
+     bool audio_processor_initialized_ = false;
+     bool voice_detected_ = false;
+-    bool service_stopped_ = true;
++    std::atomic<bool> service_stopped_{true};
+     bool audio_input_need_warmup_ = false;
+ 
++    // Notify playback: generation guard so blocked producers wake up when
++    // queues are cleared, and a latch so the drained callback fires once.
++    std::atomic<uint32_t> playback_generation_{0};
++    bool playback_drained_notified_ = true;
++
+     esp_timer_handle_t audio_power_timer_ = nullptr;
+     std::chrono::steady_clock::time_point last_input_time_;
+     std::chrono::steady_clock::time_point last_output_time_;
+diff --git a/main/audio/demuxer/ogg_demuxer.cc b/main/audio/demuxer/ogg_demuxer.cc
+index 6b60876..c8bcfac 100644
+--- a/main/audio/demuxer/ogg_demuxer.cc
++++ b/main/audio/demuxer/ogg_demuxer.cc
+@@ -1,48 +1,103 @@
+ #include "ogg_demuxer.h"
++
++#include <algorithm>
++
+ #include "esp_log.h"
+ 
+ #define TAG "OggDemuxer"
+ 
+-/// @brief 重置解封器
++/// @brief Reset the demuxer.
+ void OggDemuxer::Reset()
+ {
+     opus_info_ = {
+         .head_seen = false,
+         .tags_seen = false,
++        .mono = false,
+         .sample_rate = 48000
+     };
+ 
++    has_error_ = false;
++    packet_count_ = 0;
++
+     state_ = ParseState::FIND_PAGE;
+     ctx_.packet_len = 0;
+     ctx_.seg_count = 0;
+     ctx_.seg_index = 0;
+     ctx_.data_offset = 0;
+-    ctx_.bytes_needed = 4;          // 需要4字节"OggS"
++    ctx_.bytes_needed = 4;          // Four bytes are needed for "OggS"
+     ctx_.seg_remaining = 0;
+     ctx_.body_size = 0;
+     ctx_.body_offset = 0;
+     ctx_.packet_continued = false;
+     
+-    // 清空缓冲区数据
++    // Clear buffered data.
+     memset(ctx_.header, 0, sizeof(ctx_.header));
+     memset(ctx_.seg_table, 0, sizeof(ctx_.seg_table));
+     memset(ctx_.packet_buf, 0, sizeof(ctx_.packet_buf));
+ }
+ 
+-/// @brief 处理数据块
+-/// @param data 输入数据
+-/// @param size 输入数据大小
+-/// @return 已处理的字节数
++int OggDemuxer::GetOpusPacketDurationMs(const uint8_t* data, size_t size) {
++    if (data == nullptr || size == 0) {
++        return -1;
++    }
++
++    const uint8_t toc = data[0];
++    const uint8_t config = toc >> 3;
++    int frame_duration_us = 0;
++    if (config < 12) {
++        static constexpr int kSilkDurationsUs[] = {10000, 20000, 40000, 60000};
++        frame_duration_us = kSilkDurationsUs[config & 0x03];
++    } else if (config < 16) {
++        frame_duration_us = (config & 0x01) ? 20000 : 10000;
++    } else {
++        static constexpr int kCeltDurationsUs[] = {2500, 5000, 10000, 20000};
++        frame_duration_us = kCeltDurationsUs[config & 0x03];
++    }
++
++    int frame_count = 0;
++    switch (toc & 0x03) {
++        case 0:
++            frame_count = 1;
++            break;
++        case 1:
++        case 2:
++            frame_count = 2;
++            break;
++        case 3:
++            if (size < 2) {
++                return -1;
++            }
++            frame_count = data[1] & 0x3f;
++            break;
++    }
++
++    const int packet_duration_us = frame_duration_us * frame_count;
++    if (frame_count == 0 || packet_duration_us > 120000 || packet_duration_us % 1000 != 0) {
++        return -1;
++    }
++    return packet_duration_us / 1000;
++}
++
++bool OggDemuxer::Finish() const {
++    return !has_error_ && opus_info_.head_seen && opus_info_.tags_seen && opus_info_.mono &&
++           packet_count_ > 0 && state_ == ParseState::FIND_PAGE && ctx_.bytes_needed == 4 &&
++           ctx_.packet_len == 0;
++}
++
++/// @brief Process an input block.
++/// @param data Input data.
++/// @param size Input size in bytes.
++/// @return Number of bytes processed.
+ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+ {
+-    size_t processed = 0;  // 已处理的字节数
++    size_t processed = 0;  // Number of bytes processed
+     
+     while (processed < size) {
+         switch (state_) {
+           case ParseState::FIND_PAGE: {
+-            // 寻找页头"OggS"
++            // Find the "OggS" page capture pattern.
+             if (ctx_.bytes_needed < 4) {
+-                // 处理不完整的"OggS"匹配（跨数据块）
++                // Continue a partial "OggS" match across input blocks.
+                 size_t to_copy = std::min(size - processed, ctx_.bytes_needed);
+                 memcpy(ctx_.header + (4 - ctx_.bytes_needed), data + processed, to_copy);
+                 
+@@ -50,27 +105,27 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 ctx_.bytes_needed -= to_copy;
+                 
+                 if (ctx_.bytes_needed == 0) {
+-                    // 检查是否匹配"OggS"
++                    // Check whether the capture pattern matches "OggS".
+                     if (memcmp(ctx_.header, "OggS", 4) == 0) {
+                         state_ = ParseState::PARSE_HEADER;
+                         ctx_.data_offset = 4;
+-                        ctx_.bytes_needed = 27 - 4;  // 还需要23字节完成页头
++                        ctx_.bytes_needed = 27 - 4;  // 23 more bytes complete the header
+                     } else {
+-                        // 匹配失败，滑动1字节继续匹配
++                        // Shift by one byte and continue matching.
+                         memmove(ctx_.header, ctx_.header + 1, 3);
+                         ctx_.bytes_needed = 1;
+                     }
+                 } else {
+-                    // 数据不足，等待更多数据
++                    // Wait for more data.
+                     return processed;
+                 }
+             } else if (ctx_.bytes_needed == 4) {
+-                // 在数据块中查找完整的"OggS"
++                // Search the input block for a complete "OggS" pattern.
+                 bool found = false;
+                 size_t i = 0;
+                 size_t remaining = size - processed;
+                 
+-                // 搜索"OggS"
++                // Search for "OggS".
+                 for (; i + 4 <= remaining; i++) {
+                     if (memcmp(data + processed + i, "OggS", 4) == 0) {
+                         found = true;
+@@ -79,31 +134,31 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 }
+                 
+                 if (found) {
+-                    // 找到"OggS"，跳过已搜索的字节
++                    // Skip bytes before the matched "OggS" pattern.
+                     processed += i;
+                     
+-                    // 不记录找到的"OggS"，无必要
++                    // The matched "OggS" bytes do not need to be copied.
+                     // memcpy(ctx_.header, data + processed, 4);
+                     processed += 4;
+                     
+                     state_ = ParseState::PARSE_HEADER;
+                     ctx_.data_offset = 4;
+-                    ctx_.bytes_needed = 27 - 4;  // 还需要23字节
++                    ctx_.bytes_needed = 27 - 4;  // 23 more bytes are needed
+                 } else {
+-                    // 没有找到完整"OggS"，保存可能的部分匹配
++                    // Save a possible partial match when no complete pattern is found.
+                     size_t partial_len = remaining - i;
+                     if (partial_len > 0) {
+                         memcpy(ctx_.header, data + processed + i, partial_len);
+                         ctx_.bytes_needed = 4 - partial_len;
+                         processed += i + partial_len;
+                     } else {
+-                        processed += i;  // 已搜索所有字节
++                        processed += i;  // All bytes have been searched
+                     }
+-                    return processed;  // 返回已处理的字节数
++                    return processed;
+                 }
+             } else {
+                 ESP_LOGE(TAG, "OggDemuxer run in error state: bytes_needed=%zu", ctx_.bytes_needed);
+-                Reset();
++                has_error_ = true;
+                 return processed;
+             }
+             break;
+@@ -113,16 +168,16 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+             size_t available = size - processed;
+             
+             if (available < ctx_.bytes_needed) {
+-                // 数据不足，复制可用的部分
++                // Copy the available bytes and wait for more data.
+                 memcpy(ctx_.header + ctx_.data_offset, 
+                         data + processed, available);
+                 
+                 ctx_.data_offset += available;
+                 ctx_.bytes_needed -= available;
+                 processed += available;
+-                return processed;  // 等待更多数据
++                return processed;
+             } else {
+-                // 有足够的数据完成页头
++                // Complete the page header.
+                 size_t to_copy = ctx_.bytes_needed;
+                 memcpy(ctx_.header + ctx_.data_offset, 
+                         data + processed, to_copy);
+@@ -131,13 +186,11 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 ctx_.data_offset += to_copy;
+                 ctx_.bytes_needed = 0;
+                 
+-                // 验证页头
++                // Validate the page header.
+                 if (ctx_.header[4] != 0) {
+-                    ESP_LOGE(TAG, "无效的Ogg版本: %d", ctx_.header[4]);
+-                    state_ = ParseState::FIND_PAGE;
+-                    ctx_.bytes_needed = 4;
+-                    ctx_.data_offset = 0;
+-                    break;
++                    ESP_LOGE(TAG, "Invalid Ogg version: %d", ctx_.header[4]);
++                    has_error_ = true;
++                    return processed;
+                 }
+                 
+                 ctx_.seg_count = ctx_.header[26];
+@@ -146,15 +199,14 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                     ctx_.bytes_needed = ctx_.seg_count;
+                     ctx_.data_offset = 0;
+                 } else if (ctx_.seg_count == 0) {
+-                    // 没有段，直接跳到下一个页面
++                    // Skip directly to the next page when there are no segments.
+                     state_ = ParseState::FIND_PAGE;
+                     ctx_.bytes_needed = 4;
+                     ctx_.data_offset = 0;
+                 } else {
+-                    ESP_LOGE(TAG, "无效的段数: %u", ctx_.seg_count);
+-                    state_ = ParseState::FIND_PAGE;
+-                    ctx_.bytes_needed = 4;
+-                    ctx_.data_offset = 0;
++                    ESP_LOGE(TAG, "Invalid Ogg segment count: %u", ctx_.seg_count);
++                    has_error_ = true;
++                    return processed;
+                 }
+             }
+             break;
+@@ -170,7 +222,7 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 ctx_.data_offset += available;
+                 ctx_.bytes_needed -= available;
+                 processed += available;
+-                return processed;  // 等待更多数据
++                return processed;
+             } else {
+                 size_t to_copy = ctx_.bytes_needed;
+                 memcpy(ctx_.seg_table + ctx_.data_offset, 
+@@ -184,7 +236,7 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 ctx_.seg_index = 0;
+                 ctx_.data_offset = 0;
+                 
+-                // 计算数据体总大小
++                // Calculate the total page body size.
+                 ctx_.body_size = 0;
+                 for (size_t i = 0; i < ctx_.seg_count; ++i) {
+                     ctx_.body_size += ctx_.seg_table[i];
+@@ -199,25 +251,22 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+             while (ctx_.seg_index < ctx_.seg_count && processed < size) {
+                 uint8_t seg_len = ctx_.seg_table[ctx_.seg_index];
+                 
+-                // 检查段数据是否已经部分读取
++                // Continue a partially read segment.
+                 if (ctx_.seg_remaining > 0) {
+                     seg_len = ctx_.seg_remaining;
+                 } else {
+                     ctx_.seg_remaining = seg_len;
+                 }
+                 
+-                // 检查缓冲区是否足够
++                // Check that the packet buffer has enough space.
+                 if (ctx_.packet_len + seg_len > sizeof(ctx_.packet_buf)) {
+-                    ESP_LOGE(TAG, "包缓冲区溢出: %zu + %u > %zu", ctx_.packet_len, seg_len, sizeof(ctx_.packet_buf));
+-                    state_ = ParseState::FIND_PAGE;
+-                    ctx_.packet_len = 0;
+-                    ctx_.packet_continued = false;
+-                    ctx_.seg_remaining = 0;
+-                    ctx_.bytes_needed = 4;
++                    ESP_LOGE(TAG, "Ogg packet buffer overflow: %zu + %u > %zu",
++                             ctx_.packet_len, seg_len, sizeof(ctx_.packet_buf));
++                    has_error_ = true;
+                     return processed;
+                 }
+                 
+-                // 复制数据
++                // Copy segment data.
+                 size_t to_copy = std::min(size - processed, (size_t)seg_len);
+                 memcpy(ctx_.packet_buf + ctx_.packet_len, data + processed, to_copy);
+                 
+@@ -226,27 +275,51 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                 ctx_.body_offset += to_copy;
+                 ctx_.seg_remaining -= to_copy;
+                 
+-                // 检查段是否完整
++                // Check whether the segment is complete.
+                 if (ctx_.seg_remaining > 0) {
+-                    // 段不完整，等待更多数据
++                    // Wait for the rest of the segment.
+                     return processed;
+                 }
+                 
+-                // 段完整
++                // The segment is complete.
+                 bool seg_continued = (ctx_.seg_table[ctx_.seg_index] == 255);
+                 
+                 if (!seg_continued) {
+-                    // 包结束
++                    // The packet ends at this segment.
+                     if (ctx_.packet_len) {
+                         if (!opus_info_.head_seen) {
+                             if (ctx_.packet_len >=8 && memcmp(ctx_.packet_buf, "OpusHead", 8) == 0) {
+                                 opus_info_.head_seen = true;
+                                 if (ctx_.packet_len >= 19) {
+-                                    opus_info_.sample_rate = ctx_.packet_buf[12] | 
+-                                                            (ctx_.packet_buf[13] << 8) | 
+-                                                            (ctx_.packet_buf[14] << 16) | 
+-                                                            (ctx_.packet_buf[15] << 24);
++                                    opus_info_.mono = ctx_.packet_buf[9] == 1;
++                                    const uint32_t input_sample_rate =
++                                        static_cast<uint32_t>(ctx_.packet_buf[12]) |
++                                        (static_cast<uint32_t>(ctx_.packet_buf[13]) << 8) |
++                                        (static_cast<uint32_t>(ctx_.packet_buf[14]) << 16) |
++                                        (static_cast<uint32_t>(ctx_.packet_buf[15]) << 24);
++                                    switch (input_sample_rate) {
++                                        case 8000:
++                                        case 12000:
++                                        case 16000:
++                                        case 24000:
++                                        case 48000:
++                                            opus_info_.sample_rate = input_sample_rate;
++                                            break;
++                                        default:
++                                            // The OpusHead input rate is informational. Decode at a
++                                            // native Opus rate when it is not directly supported.
++                                            opus_info_.sample_rate = 48000;
++                                            break;
++                                    }
+                                     ESP_LOGD(TAG, "OpusHead found, sample_rate=%d", opus_info_.sample_rate);
++                                    if (!opus_info_.mono) {
++                                        ESP_LOGE(TAG, "Only mono Ogg Opus streams are supported");
++                                        has_error_ = true;
++                                        return processed;
++                                    }
++                                } else {
++                                    has_error_ = true;
++                                    return processed;
+                                 }
+                                 ctx_.packet_len = 0;
+                                 ctx_.packet_continued = false;
+@@ -267,11 +340,20 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+                             }
+                         }
+                         if (opus_info_.head_seen && opus_info_.tags_seen) {
+-                            if (on_demuxer_finished_) {
+-                                on_demuxer_finished_(ctx_.packet_buf, opus_info_.sample_rate, ctx_.packet_len);
++                            const int frame_duration_ms =
++                                GetOpusPacketDurationMs(ctx_.packet_buf, ctx_.packet_len);
++                            if (frame_duration_ms <= 0) {
++                                ESP_LOGE(TAG, "Unsupported Opus packet duration");
++                                has_error_ = true;
++                                return processed;
++                            }
++                            ++packet_count_;
++                            if (on_packet_) {
++                                on_packet_(ctx_.packet_buf, opus_info_.sample_rate,
++                                           frame_duration_ms, ctx_.packet_len);
+                             }
+                         } else {
+-                            ESP_LOGW(TAG, "当前Ogg容器未解析到OpusHead/OpusTags，丢弃");
++                            ESP_LOGW(TAG, "Dropping Ogg packet before OpusHead/OpusTags");
+                         }
+                     }
+                     ctx_.packet_len = 0;
+@@ -285,18 +367,18 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+             }
+             
+             if (ctx_.seg_index == ctx_.seg_count) {
+-                // 检查是否所有数据体都已读取
++                // Check whether the complete page body was read.
+                 if (ctx_.body_offset < ctx_.body_size) {
+-                    ESP_LOGW(TAG, "数据体不完整: %zu/%zu", 
++                    ESP_LOGW(TAG, "Incomplete Ogg page body: %zu/%zu",
+                             ctx_.body_offset, ctx_.body_size);
+                 }
+                 
+-                // 如果包跨页，保持packet_len和packet_continued
++                // Preserve packet state when a packet continues on the next page.
+                 if (!ctx_.packet_continued) {
+                     ctx_.packet_len = 0;
+                 }
+                 
+-                // 进入下一页面
++                // Continue with the next page.
+                 state_ = ParseState::FIND_PAGE;
+                 ctx_.bytes_needed = 4;
+                 ctx_.data_offset = 0;
+@@ -308,4 +390,3 @@ size_t OggDemuxer::Process(const uint8_t* data, size_t size)
+     
+     return processed;
+ }
+-
+diff --git a/main/audio/demuxer/ogg_demuxer.h b/main/audio/demuxer/ogg_demuxer.h
+index 1af4456..ae4e72a 100644
+--- a/main/audio/demuxer/ogg_demuxer.h
++++ b/main/audio/demuxer/ogg_demuxer.h
+@@ -4,6 +4,7 @@
+ #include <functional>
+ #include <cstdint>
+ #include <cstring>
++#include <utility>
+ #include <vector>
+ 
+ class OggDemuxer {
+@@ -18,24 +19,25 @@ private:
+     struct Opus_t {
+         bool    head_seen{false};
+         bool    tags_seen{false};
++        bool    mono{false};
+         int     sample_rate{48000};
+     };
+ 
+ 
+-    // 使用固定大小的缓冲区避免动态分配
++    // Use fixed-size buffers to avoid dynamic allocation.
+     struct context_t {
+-        bool packet_continued{false};   // 当前包是否跨多个段
+-        uint8_t header[27];             // Ogg页头
+-        uint8_t seg_table[255];         // 当前存储的段表
+-        uint8_t packet_buf[8192];       // 8KB包缓冲区
+-        size_t packet_len = 0;          // 缓冲区中累计的数据长度
+-        size_t seg_count = 0;           // 当前页段数
+-        size_t seg_index = 0;           // 当前处理的段索引
+-        size_t data_offset = 0;         // 解析当前阶段已读取的字节数
+-        size_t bytes_needed = 0;        // 解析当前字段还需要读取的字节数
+-        size_t seg_remaining = 0;       // 当前段剩余需要读取的字节数
+-        size_t body_size = 0;           // 数据体总大小
+-        size_t body_offset = 0;         // 数据体已读取的字节数
++        bool packet_continued{false};   // Whether the current packet spans segments
++        uint8_t header[27];             // Ogg page header
++        uint8_t seg_table[255];         // Current segment table
++        uint8_t packet_buf[2048];       // 2 KB packet buffer
++        size_t packet_len = 0;          // Bytes accumulated in the packet buffer
++        size_t seg_count = 0;           // Segment count in the current page
++        size_t seg_index = 0;           // Current segment index
++        size_t data_offset = 0;         // Bytes read in the current parsing stage
++        size_t bytes_needed = 0;        // Bytes still needed for the current field
++        size_t seg_remaining = 0;       // Bytes remaining in the current segment
++        size_t body_size = 0;           // Total page body size
++        size_t body_offset = 0;         // Bytes read from the page body
+     };
+     
+ public:
+@@ -47,17 +49,23 @@ public:
+     
+     size_t Process(const uint8_t* data, size_t size);
+ 
+-    /// @brief 设置解封装完毕后回调处理函数
+-    /// @param on_demuxer_finished 
+-    void OnDemuxerFinished(std::function<void(const uint8_t* data, int sample_rate, size_t len)> on_demuxer_finished) {
+-        on_demuxer_finished_ = on_demuxer_finished;
++    bool Finish() const;
++    bool HasError() const { return has_error_; }
++
++    void OnPacket(std::function<void(const uint8_t* data, int sample_rate, int frame_duration_ms,
++                                     size_t len)> on_packet) {
++        on_packet_ = std::move(on_packet);
+     }
+ private:
+ 
+     ParseState  state_ = ParseState::FIND_PAGE;
+     context_t   ctx_;
+     Opus_t      opus_info_;
+-    std::function<void(const uint8_t*, int, size_t)> on_demuxer_finished_;
++    bool has_error_ = false;
++    size_t packet_count_ = 0;
++    std::function<void(const uint8_t*, int, int, size_t)> on_packet_;
++
++    static int GetOpusPacketDurationMs(const uint8_t* data, size_t size);
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 377685b..de34930 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -203,7 +203,8 @@ void WifiBoard::EnterWifiConfigMode() {
+     auto& app = Application::GetInstance();
+     auto state = app.GetDeviceState();
+ 
+-    if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateIdle) {
++    if (state == kDeviceStateSpeaking || state == kDeviceStateNotifying ||
++        state == kDeviceStateListening || state == kDeviceStateIdle) {
+         // Reset protocol (close audio channel, reset protocol)
+         Application::GetInstance().ResetProtocol();
+ 
+diff --git a/main/boards/jiuchuan-s3/jiuchuan_dev_board.cc b/main/boards/jiuchuan-s3/jiuchuan_dev_board.cc
+index 76c522e..318efe0 100644
+--- a/main/boards/jiuchuan-s3/jiuchuan_dev_board.cc
++++ b/main/boards/jiuchuan-s3/jiuchuan_dev_board.cc
+@@ -231,7 +231,8 @@ private:
+                 // 如果当前是聆听状态，切换到待命状态
+                 ESP_LOGI(TAG, "从聆听状态切换到待命状态");
+                 app.ToggleChatState(); // 切换到待命状态
+-            } else if (current_state == kDeviceStateSpeaking) {
++            } else if (current_state == kDeviceStateSpeaking ||
++                       current_state == kDeviceStateNotifying) {
+                 // 如果当前是说话状态，终止说话并切换到待命状态
+                 ESP_LOGI(TAG, "从说话状态切换到待命状态");
+                 app.ToggleChatState(); // 终止说话
+diff --git a/main/device_state.h b/main/device_state.h
+index 4ffafae..a769e91 100644
+--- a/main/device_state.h
++++ b/main/device_state.h
+@@ -9,6 +9,7 @@ enum DeviceState {
+     kDeviceStateConnecting,
+     kDeviceStateListening,
+     kDeviceStateSpeaking,
++    kDeviceStateNotifying,
+     kDeviceStateUpgrading,
+     kDeviceStateActivating,
+     kDeviceStateAudioTesting,
+diff --git a/main/device_state_machine.cc b/main/device_state_machine.cc
+index 30581de..d81ed19 100644
+--- a/main/device_state_machine.cc
++++ b/main/device_state_machine.cc
+@@ -14,6 +14,7 @@ static const char* const STATE_STRINGS[] = {
+     "connecting",
+     "listening",
+     "speaking",
++    "notifying",
+     "upgrading",
+     "activating",
+     "audio_testing",
+@@ -73,6 +74,7 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
+             return to == kDeviceStateConnecting ||
+                    to == kDeviceStateListening ||
+                    to == kDeviceStateSpeaking ||
++                   to == kDeviceStateNotifying ||
+                    to == kDeviceStateActivating ||
+                    to == kDeviceStateUpgrading ||
+                    to == kDeviceStateWifiConfiguring;
+@@ -92,6 +94,9 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
+             return to == kDeviceStateListening ||
+                    to == kDeviceStateIdle;
+ 
++        case kDeviceStateNotifying:
++            return to == kDeviceStateIdle;
++
+         case kDeviceStateFatalError:
+             // Cannot transition out of fatal error
+             return false;
+diff --git a/main/led/circular_strip.cc b/main/led/circular_strip.cc
+index b4111ba..3faee44 100644
+--- a/main/led/circular_strip.cc
++++ b/main/led/circular_strip.cc
+@@ -223,7 +223,8 @@ void CircularStrip::OnStateChanged() {
+             SetAllColor(color);
+             break;
+         }
+-        case kDeviceStateSpeaking: {
++        case kDeviceStateSpeaking:
++        case kDeviceStateNotifying: {
+             StripColor color = { low_brightness_, default_brightness_, low_brightness_ };
+             SetAllColor(color);
+             break;
+diff --git a/main/led/gpio_led.cc b/main/led/gpio_led.cc
+index 30eeeb2..ade7609 100644
+--- a/main/led/gpio_led.cc
++++ b/main/led/gpio_led.cc
+@@ -236,6 +236,7 @@ void GpioLed::OnStateChanged() {
+             StartFadeTask();
+             break;
+         case kDeviceStateSpeaking:
++        case kDeviceStateNotifying:
+             SetBrightness(SPEAKING_BRIGHTNESS);
+             TurnOn();
+             break;
+diff --git a/main/led/single_led.cc b/main/led/single_led.cc
+index 338af0a..722ddf2 100644
+--- a/main/led/single_led.cc
++++ b/main/led/single_led.cc
+@@ -145,6 +145,7 @@ void SingleLed::OnStateChanged() {
+             TurnOn();
+             break;
+         case kDeviceStateSpeaking:
++        case kDeviceStateNotifying:
+             SetColor(0, DEFAULT_BRIGHTNESS, 0);
+             TurnOn();
+             break;
+diff --git a/main/notify/notify_player.cc b/main/notify/notify_player.cc
+new file mode 100644
+index 0000000..95d42aa
+--- /dev/null
++++ b/main/notify/notify_player.cc
+@@ -0,0 +1,284 @@
++#include "notify_player.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <memory>
++
++#include <esp_log.h>
++
++#include "board.h"
++#include "http.h"
++#include "ogg_demuxer.h"
++
++namespace {
++constexpr int kHttpTimeoutMs = 5000;
++constexpr size_t kHttpReadBufferSize = 1024;
++constexpr uint32_t kNotifyTaskStackSize = 6144;
++constexpr UBaseType_t kNotifyTaskPriority = 2;
++const char* TAG = "NotifyPlayer";
++
++bool IsSupportedUrl(const std::string& url) {
++    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
++}
++}  // namespace
++
++NotifyPlayer::NotifyPlayer(AudioService& audio_service) : audio_service_(audio_service) {}
++
++NotifyPlayer::~NotifyPlayer() { Stop(); }
++
++bool NotifyPlayer::Start(std::string audio_url, std::vector<NotifySubtitle> subtitles,
++                         uint32_t playback_id, SubtitleCallback subtitle_callback,
++                         FinishedCallback finished_callback) {
++    if (playback_id == 0 || !IsSupportedUrl(audio_url)) {
++        return false;
++    }
++
++    std::stable_sort(subtitles.begin(), subtitles.end(),
++                     [](const NotifySubtitle& left, const NotifySubtitle& right) {
++                         return left.start_ms < right.start_ms;
++                     });
++
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (active_ || worker_running_) {
++            return false;
++        }
++        audio_url_ = std::move(audio_url);
++        subtitles_ = std::move(subtitles);
++        displayed_text_.clear();
++        subtitle_callback_ = std::move(subtitle_callback);
++        finished_callback_ = std::move(finished_callback);
++        playback_id_ = playback_id;
++        last_playback_position_ms_ = 0;
++        underrun_count_ = 0;
++        next_subtitle_index_ = 0;
++        active_ = true;
++        worker_running_ = true;
++        cancelled_ = false;
++        http_finished_ = false;
++        stream_started_ = false;
++        playback_drained_ = false;
++        completion_reported_ = false;
++    }
++
++    BaseType_t created = xTaskCreate(WorkerEntry, "notify_http", kNotifyTaskStackSize, this,
++                                     kNotifyTaskPriority, &task_handle_);
++    if (created != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create notification HTTP task");
++        std::lock_guard<std::mutex> lock(mutex_);
++        active_ = false;
++        worker_running_ = false;
++        cancelled_ = true;
++        task_handle_ = nullptr;
++        return false;
++    }
++    return true;
++}
++
++void NotifyPlayer::Stop() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    cancelled_ = true;
++    active_ = false;
++    subtitles_.clear();
++    subtitle_callback_ = nullptr;
++    finished_callback_ = nullptr;
++}
++
++bool NotifyPlayer::IsActive(uint32_t playback_id) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return active_ && (playback_id == 0 || playback_id == playback_id_);
++}
++
++bool NotifyPlayer::IsBusy() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return active_ || worker_running_;
++}
++
++bool NotifyPlayer::IsCancelled(uint32_t playback_id) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return cancelled_ || !active_ || playback_id != playback_id_;
++}
++
++void NotifyPlayer::OnPlaybackProgress(uint32_t playback_id, uint32_t media_position_ms) {
++    SubtitleCallback callback;
++    std::string text;
++    bool subtitle_changed = false;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (!active_ || playback_id != playback_id_) {
++            return;
++        }
++        last_playback_position_ms_ = media_position_ms;
++        while (next_subtitle_index_ < subtitles_.size() &&
++               subtitles_[next_subtitle_index_].start_ms <= media_position_ms) {
++            text = subtitles_[next_subtitle_index_].text;
++            ++next_subtitle_index_;
++            subtitle_changed = true;
++        }
++        if (!subtitle_changed || text == displayed_text_) {
++            return;
++        }
++        displayed_text_ = text;
++        callback = subtitle_callback_;
++    }
++    if (callback) {
++        callback(playback_id, text);
++    }
++}
++
++NotifyPlayer::FinishedCallback NotifyPlayer::CompleteLocked(uint32_t& playback_id) {
++    if (completion_reported_ || !active_) {
++        return nullptr;
++    }
++    completion_reported_ = true;
++    active_ = false;
++    playback_id = playback_id_;
++    return finished_callback_;
++}
++
++void NotifyPlayer::OnPlaybackDrained() {
++    FinishedCallback callback;
++    uint32_t playback_id = 0;
++    uint32_t underrun_count = 0;
++    uint32_t media_position_ms = 0;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (!active_) {
++            return;
++        }
++        playback_drained_ = true;
++        if (http_finished_) {
++            callback = CompleteLocked(playback_id);
++        } else if (stream_started_) {
++            underrun_count = ++underrun_count_;
++            media_position_ms = last_playback_position_ms_;
++        }
++    }
++    if (underrun_count != 0) {
++        ESP_LOGW(TAG, "Notification playback underrun #%lu at %lu ms",
++                 static_cast<unsigned long>(underrun_count),
++                 static_cast<unsigned long>(media_position_ms));
++    }
++    if (callback) {
++        callback(playback_id, true);
++    }
++}
++
++void NotifyPlayer::WorkerEntry(void* arg) {
++    auto* player = static_cast<NotifyPlayer*>(arg);
++    player->WorkerTask();
++    vTaskDelete(nullptr);
++}
++
++void NotifyPlayer::WorkerTask() {
++    std::string audio_url;
++    uint32_t playback_id = 0;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        audio_url = audio_url_;
++        playback_id = playback_id_;
++    }
++
++    bool success = false;
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    if (http) {
++        http->SetTimeout(kHttpTimeoutMs);
++        http->SetHeader("Accept", "audio/ogg, application/ogg");
++        http->SetHeader("Accept-Encoding", "identity");
++        const bool opened = http->Open("GET", audio_url);
++        if (opened) {
++            const int status = http->GetStatusCode();
++            if (status >= 200 && status < 300 && !IsCancelled(playback_id)) {
++                auto demuxer = std::make_unique<OggDemuxer>();
++                uint32_t media_position_ms = 0;
++                bool packet_error = false;
++                demuxer->OnPacket(
++                    [this, playback_id, &media_position_ms, &packet_error](
++                        const uint8_t* data, int sample_rate, int frame_duration_ms, size_t size) {
++                        if (packet_error || IsCancelled(playback_id)) {
++                            packet_error = true;
++                            return;
++                        }
++
++                        auto packet = std::make_unique<AudioStreamPacket>();
++                        packet->sample_rate = sample_rate;
++                        packet->frame_duration = frame_duration_ms;
++                        packet->playback_id = playback_id;
++                        packet->media_position_ms = media_position_ms;
++                        packet->payload.assign(data, data + size);
++
++                        {
++                            std::lock_guard<std::mutex> lock(mutex_);
++                            if (cancelled_ || !active_ || playback_id != playback_id_) {
++                                packet_error = true;
++                                return;
++                            }
++                            playback_drained_ = false;
++                        }
++
++                        if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), true)) {
++                            packet_error = true;
++                            return;
++                        }
++                        {
++                            std::lock_guard<std::mutex> lock(mutex_);
++                            stream_started_ = true;
++                        }
++                        media_position_ms += frame_duration_ms;
++                    });
++
++                std::array<char, kHttpReadBufferSize> buffer;
++                while (!packet_error && !IsCancelled(playback_id)) {
++                    int size = http->Read(buffer.data(), buffer.size());
++                    if (size < 0) {
++                        ESP_LOGE(TAG, "Notification HTTP read failed: %d", http->GetLastError());
++                        break;
++                    }
++                    if (size == 0) {
++                        success = demuxer->Finish();
++                        if (!success) {
++                            ESP_LOGE(
++                                TAG,
++                                "Notification Ogg stream ended before a complete audio stream");
++                        }
++                        break;
++                    }
++                    demuxer->Process(reinterpret_cast<const uint8_t*>(buffer.data()), size);
++                    if (demuxer->HasError()) {
++                        packet_error = true;
++                    }
++                }
++            } else {
++                ESP_LOGE(TAG, "Notification HTTP request returned status %d", status);
++            }
++        } else {
++            ESP_LOGE(TAG, "Failed to open notification HTTP request: %d", http->GetLastError());
++        }
++        http->Close();
++        http.reset();
++    }
++
++    FinishedCallback callback;
++    uint32_t completed_playback_id = 0;
++    bool report_success = false;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        worker_running_ = false;
++        task_handle_ = nullptr;
++        if (!cancelled_ && active_ && playback_id == playback_id_) {
++            if (!success) {
++                callback = CompleteLocked(completed_playback_id);
++            } else {
++                http_finished_ = true;
++                if (playback_drained_) {
++                    callback = CompleteLocked(completed_playback_id);
++                    report_success = true;
++                }
++            }
++        }
++    }
++    if (callback) {
++        callback(completed_playback_id, report_success);
++    }
++}
+diff --git a/main/notify/notify_player.h b/main/notify/notify_player.h
+new file mode 100644
+index 0000000..eaf2796
+--- /dev/null
++++ b/main/notify/notify_player.h
+@@ -0,0 +1,63 @@
++#ifndef NOTIFY_PLAYER_H_
++#define NOTIFY_PLAYER_H_
++
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "audio_service.h"
++
++struct NotifySubtitle {
++    uint32_t start_ms = 0;
++    std::string text;
++};
++
++class NotifyPlayer {
++public:
++    using SubtitleCallback = std::function<void(uint32_t playback_id, const std::string& text)>;
++    using FinishedCallback = std::function<void(uint32_t playback_id, bool success)>;
++
++    explicit NotifyPlayer(AudioService& audio_service);
++    ~NotifyPlayer();
++
++    bool Start(std::string audio_url, std::vector<NotifySubtitle> subtitles, uint32_t playback_id,
++               SubtitleCallback subtitle_callback, FinishedCallback finished_callback);
++    void Stop();
++    void OnPlaybackProgress(uint32_t playback_id, uint32_t media_position_ms);
++    void OnPlaybackDrained();
++    bool IsActive(uint32_t playback_id = 0) const;
++    bool IsBusy() const;
++
++private:
++    AudioService& audio_service_;
++    mutable std::mutex mutex_;
++    std::string audio_url_;
++    std::vector<NotifySubtitle> subtitles_;
++    std::string displayed_text_;
++    SubtitleCallback subtitle_callback_;
++    FinishedCallback finished_callback_;
++    TaskHandle_t task_handle_ = nullptr;
++    uint32_t playback_id_ = 0;
++    uint32_t last_playback_position_ms_ = 0;
++    uint32_t underrun_count_ = 0;
++    size_t next_subtitle_index_ = 0;
++    bool active_ = false;
++    bool worker_running_ = false;
++    bool cancelled_ = false;
++    bool http_finished_ = false;
++    bool stream_started_ = false;
++    bool playback_drained_ = false;
++    bool completion_reported_ = false;
++
++    static void WorkerEntry(void* arg);
++    void WorkerTask();
++    bool IsCancelled(uint32_t playback_id) const;
++    FinishedCallback CompleteLocked(uint32_t& playback_id);
++};
++
++#endif  // NOTIFY_PLAYER_H_
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 28ef604..18fcff3 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -11,6 +11,8 @@ struct AudioStreamPacket {
+     int sample_rate = 0;
+     int frame_duration = 0;
+     uint32_t timestamp = 0;
++    uint32_t playback_id = 0;
++    uint32_t media_position_ms = 0;
+     std::vector<uint8_t> payload;
+ };
+ 

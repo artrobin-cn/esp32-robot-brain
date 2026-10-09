@@ -1,0 +1,237 @@
+# StackChan 桥接服务配置
+# 改完重启服务生效：./start.sh restart
+
+server:
+  host: 0.0.0.0          # 局域网可访问；若只想本机访问改 127.0.0.1
+  port: 8787
+
+# ---------------- Hermes 集成 ----------------
+hermes:
+  # hermes 可执行文件路径（which hermes 确认）
+  bin: hermes   # which hermes 确认在 PATH，或填绝对路径
+  # 一次性任务的额外参数。
+  # 无人值守场景下 Hermes 可能卡在工具审批上，需要 --yolo 才能全自动。
+  # 2026-09-11 产品确认启用 YOLO：这里加 --yolo，机器人派发的任务不再等审批。
+  # ⚠️ --yolo = 让 Agent 无审批执行工具（含删文件、跑命令），安全自负。
+  # 想撤回：改回 []  即可（并且可以顺手把 ~/.hermes/config.yaml 的
+  # approvals.mode 从 "off" 改回 "smart"）。
+  extra_args: ["--yolo"]
+  # 单独转发消息用的飞书目标（hermes send --to xxx）
+  feishu_target: "feishu:oc_xxxxxxxxxxxxxxxx"   # hermes send --to 的目标，hermes targets 可查
+  # 单个任务超时（秒）
+  task_timeout: 600
+
+# ---------------- 视觉判定 ----------------
+vision:
+  # opencv : 本机 OpenCV 人脸检测（推荐，免费、不上云、快）
+  # ollama : 本机视觉大模型（能判断"在不在专注工作"，较慢）
+  # off    : 关闭判定，/vision 只记录照片不判断
+  mode: opencv
+  # YuNet 模型路径（可选，比 Haar 准很多）。下载后填这里，留空则用内置 Haar
+  # 下载：https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+  yunet_model: ""
+  # ollama 配置（mode=ollama 时生效）
+  ollama_url: "http://127.0.0.1:11434/api/generate"
+  ollama_model: "qwen2.5vl:7b"
+  # 云端视觉 API（2026-09-16，产品决策：本机不跑 ollama，用大厂便宜/免费 API）。
+  # OpenAI 兼容协议。推荐（按成本）：
+  #   智谱 GLM-4V-Flash（免费）：base_url: https://open.bigmodel.cn/api/paas/v4/chat/completions
+  #   阿里 qwen-vl-plus（约 0.8 厘/张）：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  # 触发频率 = 拍照频率（白天 <100 张/天），成本可忽略。
+  # api_key 优先读环境变量 STACKCHAN_VISION_API_KEY，填这里也行（局域网内注意保密）。
+  api:
+    base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    model: "glm-4v-flash"
+    api_key: ""
+  # 画面灰度均值低于此值 → 判定为 unknown（关灯 / 镜头被挡）
+  dark_threshold: 25
+  # 帧差判据的阈值（0-255 尺度的平均绝对差）
+  # 判为"有人"需要：上一轮已在座 + 画面变化量 ≥ 此值
+  # 调法：正常工作一天后看 /status 里 last_photo.detail.motion 的分布：
+  #   人坐着不动时通常 1~5，转身/移动时 5~30，空工位 <1
+  motion_in_seat_threshold: 2.5
+  # 前后两张亮度均值变化超过此值 → 认为是开关灯/屏幕切换，帧差判据作废
+  luma_change_guard: 20.0
+  # 连续几次"无人脸 + 画面不动"才判为离座。
+  # 调大 = 更保守（不容易误判离座，但离座后归零慢一轮）；
+  # 调成 1 = 单帧无脸不动即判离座（YuNet 偶发漏检会把在座计时打断）。
+  absent_confirm_samples: 2
+  # "无人脸但画面在动"视为转身/低头的回溯窗口（分钟）
+  # 只有在这个窗口内刚确认过在座，才把运动当作"同一个人在动"
+  in_seat_context_minutes: 30
+
+# ---------------- 久坐提醒策略 ----------------
+presence:
+  enabled: true
+  # 采样周期（分钟）—— 建议 5，与固件端拍照间隔一致
+  sample_minutes: 5
+  # 连续在座多少分钟触发提醒
+  remind_after_minutes: 30
+  # 提醒后重置为多少分钟（避免刚提醒完又立刻提醒）
+  reset_to_minutes: 25
+  # 连续几次"无人"才认为离座（防抖：起身倒水不清零）
+  absent_streak_to_reset: 2
+  # 每日提醒上限
+  max_reminders_per_day: 6
+  # 生效时段（24 小时制），周末默认不生效
+  active_hours: [9, 18]
+  active_weekdays: [1, 2, 3, 4, 5]   # 周一=1 ... 周日=7
+  # 提醒文案池，随机取一条
+  messages:
+    - "主人，起来走两步吧，顺便看看远处放松眼睛。"
+    - "已经坐了一会儿了，喝口水、活动一下肩颈。"
+    - "该起身了，站一会儿对身体好。"
+
+# ---------------- 喝水提醒（2026-09-16 健康陪伴路线 Phase 1）----------------
+water:
+  # 总开关。关闭时 /vision 完全不做水位判定（零开销）。
+  # 打开前先确认 vision.api 配置好了（base_url + model + api_key）
+  enabled: false
+  # 水位判定方式：
+  # off    : Phase 1 骨架，只记录不判定
+  # api    : 云端视觉 API（2026-09-16 主推，用 vision.api 配置）
+  # ollama : 本机 ollama 视觉模型判水位（部分设备内存紧张，已不推荐，保留兼容）
+  judge_mode: api
+  # 判水位用的视觉模型（留空则用 vision.ollama_model）
+  ollama_model: ""
+  # 两次喝水提醒的最小间隔（分钟）
+  cooldown_minutes: 60
+  # 每日提醒上限
+  daily_limit: 6
+
+# ---------------- 行为分析（2026-09-16 产品立项，桥接侧照片流规则引擎）----------------
+behavior:
+  # 坐姿检测：在座照顺带判坐姿（GOOD/HUNCHING/SLUMPED），连续 N 轮不佳才提醒
+  posture_enabled: true
+  posture_consecutive_rounds: 2      # 连续多少轮（每轮约 5 分钟）不佳才提醒
+  posture_cooldown_minutes: 60       # 两次坐姿提醒最小间隔
+  posture_daily_limit: 4             # 每日坐姿提醒上限
+  # 水位线追踪：水位百分比 Δ≥10% 记一次"显著变化"；超过 water_still_minutes 无变化且人在座 → 提醒喝水
+  water_still_minutes: 30
+  water_still_cooldown_minutes: 60   # 两次"该喝水"提醒最小间隔
+  water_still_daily_limit: 4         # 每日"该喝水"提醒上限
+  # 提醒是否让机器人开口（false 则只推飞书）
+  speak: true
+  # 提醒文案（口语化，想换口味改这里就行）
+  posture_message: "主人，坐直一点，别驼背哦。"
+  water_still_message: "主人，有一阵子没喝水了，端起水杯喝两口吧。"
+  # 机器人开口播报（推 speak 队列，叮咚+语音）
+  speak: true
+  # 播报文案，{level_text} 会被替换为"快喝完了"/"已经空了"
+  remind_message: "主人，水杯{level_text}，该喝水啦。"
+
+# ---------------- 提醒投递 ----------------
+notify:
+  # 推飞书留痕
+  feishu: true
+  # 照片是否落盘（2026-09-16 打开：Dashboard 要展示素材照片；仅局域网可访问）
+  save_photos: true
+  # 落盘时保留天数
+  photo_retention_days: 7
+
+# ---------------- 安全 ----------------
+security:
+  # 允许转发给 Hermes 的指令必须命中以下关键词之一（留空 = 不限制）
+  # P1-⑧（2026-09-11 产品确认）：白名单扩到 30+，"说法一偏就被拦"的情况大幅减少。
+  # 想彻底不拦：把列表换成只有一个 "*" 即可放行一切。
+  task_keywords:
+    - "日志"
+    - "日报"
+    - "周报"
+    - "报告"
+    - "会议"
+    - "纪要"
+    - "整理"
+    - "总结"
+    - "日程"
+    - "安排"
+    - "回款"
+    - "发票"
+    - "报销"
+    - "提醒"
+    # ---- 以下为 2026-09-11 扩充 ----
+    - "查询"
+    - "查一下"
+    - "查查"
+    - "搜索"
+    - "记录"
+    - "待办"
+    - "任务"
+    - "邮件"
+    - "文档"
+    - "表格"
+    - "数据"
+    - "统计"
+    - "分析"
+    - "汇总"
+    - "预算"
+    - "支出"
+    - "收入"
+    - "结算"
+    - "工资"
+    - "报价"
+    - "合同"
+    - "客户"
+    - "项目"
+    - "进度"
+    - "起草"
+    - "帮我"
+    - "翻译"
+    - "草稿"
+    - "方案"
+    - "笔记"
+    - "备忘"
+  # 设备请求鉴权 token（留空 = 不校验）。建议设一个，写进固件配置
+  device_token: ""   # 运行前自设一个随机值（如 openssl rand -hex 16），同时写进固件 CONFIG_STACKCHAN_BRIDGE_TOKEN
+
+# ---------------- 日历播报（P2-⑨ 反向通道） ----------------
+# 到点的飞书日程 → 机器人开口播报 + 飞书留痕
+calendar:
+  # 总开关。fetch_cmd 为空时即使 true 也不工作
+  enabled: false
+  # 输出日程 JSON 的命令。{start} {end} 会被替换成今天/明天 0 点（ISO8601 带时区）。
+  # 默认用 lark-cli（本机已登录自己的飞书账号，用户身份）：
+  #   lark-cli calendar +agenda --start "{start}" --end "{end}" --format json
+  # 首次启用前先手动跑一次确认输出（若报 need_user_authorization，
+  # 需要 lark-cli auth login 授权 calendar:calendar.event:read）
+  fetch_cmd: 'lark-cli calendar +agenda --start "{start}" --end "{end}" --format json'
+  # 每 60 秒拉一次
+  poll_seconds: 60
+  # 开场前多少分钟播报，可配多个如 [30, 5]
+  lead_minutes: [15]
+  # 只在 8:00~22:00 之间播报
+  announce_hours: [8, 22]
+  # 每天最多播报条数（防骚扰）。注意：只约束"主动类"播报（日历/访客/外部推）；
+  # 任务回执（用户下指令后的结果播报）不占此额度。
+  # 2026-09-15：12 太紧，一天测试+正常提醒就打满，把回执全吞了，调到 60。
+  max_speaks_per_day: 60
+  # 播报同时推飞书留痕
+  feishu: true
+
+# ---------------- 访客提醒（P2-⑬） ----------------
+# 一帧画面里同时出现多张脸 → 推飞书 + 机器人说一声"有人来了"
+visitor:
+  enabled: true
+  min_faces: 2          # 几张脸算"有人来"
+  cooldown_minutes: 10  # 两次提醒的最小间隔
+  speak: true           # 机器人要不要开口说
+
+# ---------------- 打卡式记录（P2-⑭） ----------------
+# 每天第一次确认在座时推一条飞书"几点到工位"
+punch_in:
+  enabled: true
+
+# ---------------- 下班前自动汇总（P2-⑩） ----------------
+# 每天 18:05 推飞书：几点到、累计在座多久、提醒几次
+daily_summary:
+  enabled: true
+  hour: 18
+  minute: 5
+  weekdays: [1, 2, 3, 4, 5]
+
+# ---------------- 专注度（P2-⑫，需要 vision.mode=ollama） ----------------
+# 开启后 ollama 视觉模型顺带判断"是否在玩手机"，分心时推飞书（带冷却）
+# 注意：qwen2.5vl 跑一张图要几秒~十几秒，且占本机算力；默认关闭
+focus:
+  enabled: false
+  cooldown_minutes: 45

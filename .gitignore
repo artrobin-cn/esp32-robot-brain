@@ -1,0 +1,21 @@
+.venv/
+data/
+__pycache__/
+*.pyc
+.DS_Store
+models/
+tts/
+photos/
+*.log
+*.bak*
+config.yaml
+
+# ---- firmware（ESP-IDF 构建产物与拉取的上游依赖，均不入库）----
+firmware/build*/
+firmware/managed_components/
+firmware/xiaozhi-esp32/
+firmware/components/*
+!firmware/components/esp-ml307/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/__pycache__/
