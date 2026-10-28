@@ -1,5 +1,8 @@
 # ESP32 Robot Brain —— 带摄像头 ESP32 设备的通用"大脑"
 
+> **作者：曾德畅**（GitHub: [Zeng1019](https://github.com/Zeng1019)）
+> 本分支（feature-tracking）中的人脸跟踪闭环、舵机安全熔断、Dashboard「人脸跟踪」页、语音指令路由等模块由曾德畅开发，对应 Git 提交作者为 `Zeng1019`。
+
 > **EN TL;DR**: A generic "brain" service for camera-equipped ESP32 robots & devices — StackChan (M5Stack CoreS3 + xiaozhi-esp32) is the reference implementation. A Python/Flask service that turns periodic camera snapshots into health & presence judgments (seated-posture / water-level / behavior analysis) using OpenCV or cloud vision APIs, drives voice reminders through the robot's TTS, pushes long results to Feishu Lark, and ships a Notion-style web dashboard with hot-reconfigurable settings (no firmware re-flash needed).
 
 **带摄像头的 ESP32 机器人/设备的通用"大脑"** —— StackChan 桌面机器人（M5Stack CoreS3 / xiaozhi-esp32 固件）是官方参考实现，但任何能上传照片、能轮询配置接口的 ESP32 设备都可以接入。

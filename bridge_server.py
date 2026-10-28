@@ -26,6 +26,8 @@ import json
 import os
 import random
 import re
+import socket
+import struct
 import subprocess
 import sys
 import os
@@ -160,7 +162,7 @@ def cfg(*keys, default=None):
 # --------------------------------------------------------------------------
 
 _log_lock = threading.Lock()
-_IS_TTY = sys.stdout.isatty()
+_IS_TTY = sys.stdout is not None and sys.stdout.isatty()
 
 
 def log(msg, level="INFO"):
@@ -276,6 +278,8 @@ def reset_daily_if_needed(st):
 
 _yunet = None
 _cascade = None
+_sface = None              # SFace 人脸识别模型（认"主人"而非"任意脸"）
+_user_templates = None     # 主人特征模板 np.ndarray (N, 128)，注册后常驻
 _cv2_ready = None
 _prev_gray = None
 _prev_luma = None
@@ -291,6 +295,9 @@ YUNET_URLS = [
 ]
 MODEL_DIR = DATA_DIR / "models"
 YUNET_FILE = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
+SFACE_FILE = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
+USER_FACE_FILE = DATA_DIR / "user_face.npz"   # 主人特征模板（可多张）
+OWNER_REF_FILE = DATA_DIR / "owner_ref.jpg"   # Dashboard 上传的参考照（仅展示）
 
 
 def _download_yunet():
@@ -314,9 +321,36 @@ def _download_yunet():
     return False
 
 
+def _load_user_templates():
+    """加载主人特征模板（data/user_face.npz，键 features = (N,128)）。
+
+    2026-10-10 人脸识别上线：YuNet 只能说"有张脸"，SFace 特征比对才能
+    认出"这是主人"。没有模板时识别关闭，行为退回纯检测模式。
+    """
+    global _user_templates
+    if not USER_FACE_FILE.exists():
+        _user_templates = None
+        return None
+    try:
+        import numpy as np
+        data = np.load(USER_FACE_FILE)
+        feats = np.asarray(data["features"], dtype=np.float32)
+        if feats.ndim == 1:
+            feats = feats.reshape(1, -1)
+        if feats.size == 0:
+            _user_templates = None
+            return None
+        _user_templates = feats
+        return feats.shape[0]
+    except Exception as e:  # noqa: BLE001
+        log(f"主人模板加载失败：{e}", "WARN")
+        _user_templates = None
+        return None
+
+
 def _init_opencv():
     """惰性加载 OpenCV。返回 True 表示人脸检测可用。"""
-    global _cv2_ready, _yunet, _cascade
+    global _cv2_ready, _yunet, _cascade, _sface
     if _cv2_ready is not None:
         return _cv2_ready
     try:
@@ -359,8 +393,204 @@ def _init_opencv():
         log("没有人脸检测模型，判定将始终为 unknown（不会误提醒，但久坐提醒也"
             "不会生效）。请确认模型文件已就位。", "ERROR")
 
+    # ---- 人脸识别（SFace）：config vision.recog_enabled 开启 ----
+    if _yunet is not None and cfg("vision", "recog_enabled", default=False):
+        sface_path = (cfg("vision", "recog_model", default="") or "").strip()
+        sface_candidate = Path(sface_path) if sface_path else SFACE_FILE
+        if sface_candidate.exists():
+            try:
+                _sface = cv2.FaceRecognizerSF.create(str(sface_candidate), "")
+                n = _load_user_templates()
+                if n:
+                    log(f"已加载 SFace 人脸识别模型 + 主人模板 {n} 张："
+                        f"{sface_candidate}")
+                else:
+                    log("已加载 SFace 模型，但尚无主人模板（POST /enroll 注册），"
+                        "识别暂不生效", "WARN")
+                    _sface = None
+            except Exception as e:  # noqa: BLE001
+                log(f"SFace 加载失败：{e}", "WARN")
+                _sface = None
+        else:
+            log(f"SFace 模型不存在（{sface_candidate}），人脸识别未启用", "WARN")
+
     _cv2_ready = True
     return _yunet is not None or _cascade is not None
+
+
+def _seat_roi_rect(shape_wh=None):
+    """读取 vision.seat_roi（归一化 [x, y, w, h]）。返回 (rx, ry, rw, rh) 或 None。
+
+    2026-10-09 新增：摄像头广角视野里会出现邻座/他人，导致"人不在座却判在座"。
+    seat_roi 把人脸判定和帧差都限定在用户自己的座位区域内，区域外的人脸忽略。
+    """
+    roi = cfg("vision", "seat_roi", default=None)
+    if not roi:
+        return None
+    try:
+        rx, ry, rw, rh = (float(v) for v in roi)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= rx < 1 and 0 <= ry < 1 and 0 < rw <= 1 and 0 < rh <= 1
+            and rx + rw <= 1 and ry + rh <= 1):
+        return None
+    return rx, ry, rw, rh
+
+
+def _count_faces_in_roi(dets, roi, frame_w, frame_h):
+    """统计落在 seat_roi 内的人脸。以人脸框中心点是否在区域内为准。
+
+    返回 (inside, outside, large_inside)。roi 为 None 时全部计入 inside。
+    large_inside 是框宽 >= visitor.min_face_px 的人脸数（访客判定用——
+    远处邻座只有小脸，贴近工位的真访客才会形成大脸）。
+    """
+    min_px = float(cfg("visitor", "min_face_px", default=80))
+    if roi is None:
+        inside = int(len(dets))
+        large = sum(1 for d in dets
+                    if len(d) >= 4 and float(d[2]) >= min_px)
+        return inside, 0, large
+    rx, ry, rw, rh = roi
+    inside = 0
+    outside = 0
+    large = 0
+    for d in dets:
+        try:
+            x, y, fw, fh = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cx = (x + fw / 2) / max(frame_w, 1)
+        cy = (y + fh / 2) / max(frame_h, 1)
+        if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+            inside += 1
+            if fw >= min_px:
+                large += 1
+        else:
+            outside += 1
+    return inside, outside, large
+
+
+def _cosine_sim(a, b):
+    import numpy as np
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+
+def _recognize_owner(img, dets, roi, frame_w, frame_h):
+    """对 ROI 内的每张脸提取 SFace 特征，与主人模板比对。
+
+    返回 dict：
+      user_sims     主人匹配到的最大相似度（无人脸/未启用时 None）
+      user_faces    判定为主人的人脸数（ROI 内）
+      stranger_faces  ROI 内"不是主人"的大脸数（访客判定用）
+      sims          ROI 内每张脸的 (best_sim, face_w) 列表（调试用）
+    框过小（< recog_min_face_px，默认 60px）的特征不可靠，跳过识别
+    （远处小脸不算主人也不算陌生人）。
+    """
+    out = {"user_sims": None, "user_faces": 0, "stranger_faces": 0, "sims": [],
+           "roi_faces": 0}
+    if _sface is None or _user_templates is None or dets is None:
+        return out
+    import numpy as np
+
+    min_px = float(cfg("vision", "recog_min_face_px", default=60))
+    thr = float(cfg("vision", "recog_threshold", default=0.363))
+    # 2026-10-27 用户反馈「我走了以后，它把右后方的女生认成我」：0.363 是
+    # OpenCV 官方推荐值，本来就偏松，擦线误报压不住。判定「是主人」改用
+    # 更高的门槛（实测主人 98.8% 仍通过、历史陌生人全被挡）；0.363~0.42
+    # 之间算灰区——既不认作主人也不报访客，避免两头误判。
+    owner_thr = float(cfg("vision", "recog_owner_threshold", default=0.42))
+    rx = ry = rw = rh = None
+    if roi is not None:
+        rx, ry, rw, rh = roi
+
+    best_user = None
+    for d in dets:
+        try:
+            x, y, fw, fh = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cx = (x + fw / 2) / max(frame_w, 1)
+        cy = (y + fh / 2) / max(frame_h, 1)
+        if roi is not None and not (rx <= cx <= rx + rw
+                                    and ry <= cy <= ry + rh):
+            continue
+        # ROI 内有脸（不论大小/认不认得出）：给"有人就算在座"规则用。
+        # 人离远了脸只有 40~55px，识别不可靠，但"这里坐着人"是确定的。
+        out["roi_faces"] += 1
+        if fw < min_px:
+            continue
+        try:
+            aligned = _sface.alignCrop(img, d)
+            feat = np.asarray(_sface.feature(aligned), dtype=np.float32)\
+                .reshape(-1)
+        except Exception:  # noqa: BLE001
+            continue
+        sims = [_cosine_sim(feat, t) for t in _user_templates]
+        best = max(sims) if sims else -1.0
+        out["sims"].append((round(best, 3), int(fw)))
+        if best >= owner_thr:
+            out["user_faces"] += 1
+            if best_user is None or best > best_user:
+                best_user = best
+        elif best < thr and fw >= float(cfg("visitor", "min_face_px",
+                                           default=80)):
+            out["stranger_faces"] += 1
+        # 灰区（thr <= best < owner_thr）：不认主人也不报访客，留档待定标
+        if thr - 0.08 <= best <= owner_thr + 0.13:
+            try:
+                with open(DATA_DIR / "recog_gray.log", "a",
+                          encoding="utf-8") as gf:
+                    gf.write("%s sim=%.3f w=%d roi=%s\n"
+                             % (datetime.now().isoformat(timespec="seconds"),
+                                best, int(fw),
+                                "y" if roi is not None else "n"))
+            except OSError:
+                pass
+    if best_user is not None:
+        out["user_sims"] = round(best_user, 3)
+    return out
+
+
+def _enroll_owner_face(image_bytes, replace=False):
+    """从照片里提取最大人脸特征，注册/追加为主人模板。
+
+    返回 (ok, info)。照片里没检测到脸时报错。
+    """
+    if not _init_opencv() or _yunet is None:
+        return False, "人脸检测模型不可用"
+    if _sface is None:
+        return False, "SFace 模型不可用（检查 vision.recog_enabled 与模型文件）"
+    import cv2
+    import numpy as np
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return False, "照片解码失败"
+    h, w = img.shape[:2]
+    _yunet.setInputSize((w, h))
+    result = _yunet.detect(img)
+    dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+    if dets is None or not len(dets):
+        return False, "照片里没有检测到人脸"
+    # 取最大脸（注册照默认就是主人单人照）
+    d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
+    if float(d[2]) < 60:
+        return False, f"人脸太小（{float(d[2]):.0f}px），请靠近摄像头重拍"
+    aligned = _sface.alignCrop(img, d)
+    feat = np.asarray(_sface.feature(aligned), dtype=np.float32).reshape(-1)
+
+    # 与已有模板的最高相似度（自查一致性：低说明两次注册的可能不是同一人）
+    self_sim = None
+    if _user_templates is not None and not replace:
+        self_sim = round(max(_cosine_sim(feat, t)
+                             for t in _user_templates), 3)
+        feats = np.vstack([_user_templates, feat.reshape(1, -1)])
+    else:
+        feats = feat.reshape(1, -1)
+    np.savez(USER_FACE_FILE, features=feats)
+    _load_user_templates()
+    return True, {"templates": int(feats.shape[0]), "self_sim": self_sim}
 
 
 def detect_presence_opencv(image_bytes):
@@ -368,12 +598,12 @@ def detect_presence_opencv(image_bytes):
     返回 (presence, detail)
       presence: in_seat / absent / unknown
 
-    判据优先级：
+    判据优先级（配置 vision.seat_roi 后，人脸与帧差均只看座位区域）：
       1. 画面过暗                     -> unknown（关灯/遮挡，不能判断）
-      2. YuNet 检测到人脸              -> in_seat（最可靠）
+      2. 座位区域内检测到人脸          -> in_seat（最可靠）
       3. 亮度突变 / 首帧 / 算不出帧差   -> unknown（不改变计时）
-      4. 无人脸 + 画面有变化 + 近期在座  -> in_seat（转身/低头/侧脸）
-      5. 无人脸 + 画面几乎不动，连续 N 次 -> absent（人不在工位）
+      4. 区域内有变化 + 近期在座        -> in_seat（转身/低头/侧脸）
+      5. 区域内几乎不动，连续 N 次      -> absent（人不在工位）
       6. 其余                          -> unknown
     """
     global _prev_gray, _prev_luma, _no_motion_streak, _last_in_seat_ts
@@ -394,9 +624,19 @@ def detect_presence_opencv(image_bytes):
     dark_threshold = float(cfg("vision", "dark_threshold", default=25))
 
     # --- 帧差（画面变化量）---
+    # seat_roi 生效时帧差只算座位区域，邻座/背景里的活动不再污染判定
+    roi = _seat_roi_rect()
     motion = None
     try:
         small = cv2.resize(gray, (80, 60)).astype(np.int16)
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            sx0, sy0 = int(rx * 80), int(ry * 60)
+            sx1, sy1 = int(round((rx + rw) * 80)), int(round((ry + rh) * 60))
+            if sx1 - sx0 >= 8 and sy1 - sy0 >= 8:
+                small = small[sy0:sy1, sx0:sx1]
+            else:
+                roi = None  # 区域过小，退回全帧
         if _prev_gray is not None and _prev_gray.shape == small.shape:
             motion = float(np.abs(small - _prev_gray).mean())
         _prev_gray = small
@@ -414,33 +654,71 @@ def detect_presence_opencv(image_bytes):
                            "motion": motion}
 
     faces = 0
+    faces_out_roi = 0
+    faces_large = 0
     method = "none"
+    dets_in = []
     if _yunet is not None:
         h, w = img.shape[:2]
         _yunet.setInputSize((w, h))
         result = _yunet.detect(img)
         dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
-        if dets is not None:
-            faces = int(len(dets))
+        if dets is not None and len(dets):
+            faces, faces_out_roi, faces_large = _count_faces_in_roi(
+                dets, roi, w, h)
+            dets_in = list(dets)
         method = "yunet"
     elif _cascade is not None:
         rects = _cascade.detectMultiScale(gray, scaleFactor=1.1,
                                           minNeighbors=5, minSize=(40, 40))
-        faces = int(len(rects))
+        if rects is not None and len(rects):
+            faces, faces_out_roi, faces_large = _count_faces_in_roi(
+                rects, roi, img.shape[1], img.shape[0])
         method = "haar"
 
+    # --- 人脸识别（SFace）：ROI 内的脸是主人还是别人 ---
+    recog = _recognize_owner(img, dets_in, roi, w, h) \
+        if (dets_in and _yunet is not None and roi is not None) \
+        else {"user_sims": None, "user_faces": 0, "stranger_faces": 0,
+              "sims": [], "roi_faces": 0}
+    user_faces = recog["user_faces"]
+
     detail = {"method": method, "faces": faces, "motion": motion,
+              "faces_large": faces_large,
+              "user_faces": user_faces,
+              "user_sim": recog["user_sims"],
+              "stranger_faces": recog["stranger_faces"],
+              "roi_faces": recog.get("roi_faces", 0),
+              "faces_out_roi": faces_out_roi if roi is not None else None,
               "luma_delta": None if luma_delta is None else round(luma_delta, 1),
               "no_motion_streak": _no_motion_streak,
               "mean_luma": round(mean_luma, 1)}
 
     now = time.time()
 
-    # ① 检测到人脸 —— 最可靠的信号
-    if faces >= 1:
+    # ① 座位区域内认出主人 —— 最可靠的信号（未配 ROI 时退回"有脸即在座"）
+    if user_faces >= 1 or (faces >= 1 and roi is None):
         _no_motion_streak = 0
         _last_in_seat_ts = now
-        return "in_seat", detail
+        return "in_seat", {**detail,
+                           "reason": "owner_face" if user_faces >= 1
+                           else "face"}
+
+    # ② 座位区域里有脸但都没认出是谁（2026-10-15 用户两轮反馈定稿）：
+    #    仅当"没有任何大脸被判为陌生人"时才算在座——这种情况下 ROI 里的脸
+    #    要么太小（<60px，识别被跳过，只可能是主人坐远了），要么特征提取
+    #    失败。若有大脸认不出（可能是陌生人占座）则落到 ②b 拒绝在座。
+    if (cfg("vision", "in_seat_any_face", default=True)
+            and recog.get("roi_faces", 0) >= 1
+            and recog["stranger_faces"] == 0):
+        _no_motion_streak = 0
+        _last_in_seat_ts = now
+        return "in_seat", {**detail, "reason": "face_unrecognized"}
+
+    # ②b 座位区域有大脸但不是主人 —— 拒绝在座（可能是陌生人占座），
+    # 访客提醒逻辑会单独处理 stranger_faces
+    if faces >= 1 and recog["stranger_faces"] >= 1:
+        return "unknown", {**detail, "reason": "face_not_owner"}
 
     # 亮度突变（开关灯、屏幕大面积切换）时帧差不可信；首帧也没有参照
     luma_guard = float(cfg("vision", "luma_change_guard", default=20.0))
@@ -449,15 +727,31 @@ def detect_presence_opencv(image_bytes):
         return "unknown", {**detail, "reason": "frame_not_comparable"}
 
     motion_in_seat = float(cfg("vision", "motion_in_seat_threshold", default=2.5))
+    # 无人脸时的动作兜底门槛要比有常人时的噪音高：办公室里灯光/远处同事/
+    # 窗帘等会在 ROI 内制造 2.5~4.3 的持续低幅噪音，曾把 27 分钟的离座
+    # 全程刷成"在座"（2026-10-09 实测）。有人脸确认走①，这里只兜"转身/
+    # 低头但身体仍在活动"的情况。
+    no_face_motion = float(cfg("vision", "no_face_motion_threshold",
+                               default=4.5))
+    # 动作量过大的"无人脸"帧更像人在走动/出入画面/光线剧变，而不是坐在
+    # 工位上工作（起身离开瞬间实测 50~70），同样不认。
+    no_face_motion_cap = float(cfg("vision", "no_face_motion_cap",
+                                   default=12.0))
 
     # ② 画面有变化 —— 人可能在动
     if motion >= motion_in_seat:
         _no_motion_streak = 0
         # 最近一段时间内确认过在座，才认为是同一个人转身/低头（而不是有人路过）
         window_min = float(cfg("vision", "in_seat_context_minutes", default=30))
-        if _last_in_seat_ts is not None and (now - _last_in_seat_ts) <= window_min * 60:
-            _last_in_seat_ts = now
-            return "in_seat", {**detail, "reason": "no_face_but_motion_continuous"}
+        if (_last_in_seat_ts is not None
+                and (now - _last_in_seat_ts) <= window_min * 60):
+            if no_face_motion <= motion < no_face_motion_cap:
+                # 注意：动作兜底不续命，在座上下文只由"看到人脸"刷新，
+                # 否则离座后的环境噪音能靠这条链路无限自我确认
+                return "in_seat", {**detail,
+                                   "reason": "no_face_but_motion_continuous"}
+            # 动作量太小（环境噪音）或太大（走动/光线变化）：不给在座
+            return "unknown", {**detail, "reason": "motion_out_of_working_band"}
         return "unknown", {**detail, "reason": "motion_without_context"}
 
     # ③ 画面几乎不动 —— 累计确认期后判"无人"，避免 YuNet 偶发漏检导致误判
@@ -1207,13 +1501,39 @@ def notify_feishu(text, subject=None):
     return False
 
 
+def _device_offline_s():
+    """设备心跳静默时长（秒）。从未见过设备时返回正无穷。"""
+    ts = _DEVICE_LAST_SEEN.get("ts") or 0
+    if not ts:
+        return float("inf")
+    return time.time() - ts
+
+
 def monitor_loop():
-    """兜底：即使没有新照片进来，也要按时间触发提醒"""
+    """兜底：即使没有新照片进来，也要按时间触发提醒。
+
+    2026-10-10 设备离线守卫：设备心跳 >5 分钟无请求时（死机/断网/关机），
+    久坐计时入账并暂停、不再生成提醒——否则监控线程会凭冻结的旧状态
+    把整夜离线都累计成"在座"（实测刷出 688 分钟垃圾账），恢复后还会
+    立刻误触久坐提醒。设备回来后由下一张判定照片重新起算。
+    """
     while True:
         try:
             time.sleep(60)
             with _state_lock:
                 reset_daily_if_needed(STATE)
+                if _device_offline_s() > 300:
+                    if STATE.get("in_seat_since"):
+                        # 离线期间的时长无法核实，直接丢弃不入账
+                        STATE["in_seat_since"] = None
+                        STATE["last_remind_ts"] = None
+                        STATE["offline_timer_paused"] = True
+                        save_state(STATE)
+                        log("设备心跳超时（>5 分钟无请求）：久坐计时暂停，"
+                            "不再生成提醒（设备回来后由照片重新起算）")
+                    continue
+                if STATE.pop("offline_timer_paused", None):
+                    log("设备心跳恢复：久坐计时重新可用")
                 msg = evaluate_reminder(STATE)
                 if msg:
                     push_reminder(STATE, msg)
@@ -1502,6 +1822,1005 @@ def health():
     })
 
 
+@app.route("/enroll", methods=["POST", "GET"])
+def enroll():
+    """主人脸注册：POST 一张单人照（multipart file= 或原始 JPEG），
+    提取最大脸的 SFace 特征入库（data/user_face.npz）。
+
+      POST /enroll                 追加一张模板
+      POST /enroll?replace=1       清空后重新注册
+      GET  /enroll?status=1        查看模板数量
+    注册后立即生效，无需重启。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    if request.args.get("status"):
+        if _cv2_ready is None:
+            _init_opencv()   # 懒加载未触发时模板数为 0，主动初始化一次
+        return jsonify({"ok": True,
+                        "templates": 0 if _user_templates is None
+                        else int(len(_user_templates)),
+                        "file": str(USER_FACE_FILE)})
+    file_obj = request.files.get("file")
+    image_bytes = file_obj.read() if file_obj is not None else request.get_data()
+    if not image_bytes:
+        return jsonify({"ok": False, "error": "没有收到图像数据"}), 400
+    replace = request.args.get("replace") in ("1", "true", "yes")
+    ok, info = _enroll_owner_face(image_bytes, replace=replace)
+    if not ok:
+        return jsonify({"ok": False, "error": str(info)}), 400
+    log(f"主人脸注册成功：模板 {info['templates']} 张"
+        + (f"，与已有模板自相似度 {info['self_sim']}" if info["self_sim"] is not None else ""))
+    return jsonify({"ok": True, **info})
+
+
+# ----------------------- 语音任务路由（2026-10-11 v2，MCP 版） -----------------------
+# 固件 stt 钩子 + 规则分类器判定"复杂任务"→ 打断小智抢答 → POST /agent_task。
+# 桥接把任务入队（不再往输入框注入），WorkBuddy 用协议方式取任务：
+#   · MCP 工具：bridge_mcp_server.py（stdio，注册进 ~/.workbuddy/mcp.json），
+#     get_agent_task 长轮询取单 / finish_agent_task 回传结果；
+#   · 会话看门：_agent_watcher.py 后台长轮询 /agent_task/poll，取到单即退出，
+#     WorkBuddy 收到后台任务通知后接单执行，干完 POST /agent_task/finish。
+# 结果统一由桥接 push_speak → 小栗 TTS 播报。
+# （v1 输入框注入废弃：锁屏/焦点不对就打进空气里，2026-10-11 两单全丢。）
+# 电脑关机 = 固件 POST 失败 = 固件按简单任务放行给小智，天然回退。
+
+AGENT_TASK_STATE = {"running": False, "status": "", "text": "", "id": 0,
+                    "queued_at": 0.0, "picked_at": 0.0}
+_AGENT_LOCK = threading.Lock()
+_AGENT_NEW_TASK = threading.Event()
+_AGENT_PICK_TTL_S = 120         # 派出后 120s 没被 WorkBuddy 取走 = 派送失败
+_AGENT_TASK_TIMEOUT_S = 8 * 60  # 取走后 8 分钟没回结果 = 超时释放
+
+
+def _agent_clip(text, limit=160):
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "……"
+
+
+def _agent_maybe_expire():
+    """惰性超时清理。返回 (kind, task_id) 表示刚发生一次超时需要播报。"""
+    with _AGENT_LOCK:
+        st = AGENT_TASK_STATE
+        if not st["running"]:
+            return None
+        now = time.time()
+        if st["status"] == "queued" and now - st["queued_at"] > _AGENT_PICK_TTL_S:
+            st.update(running=False, status="")
+            log(f"agent_task #{st['id']} 派送失败：{int(now - st['queued_at'])}s 无人取单", "WARN")
+            return ("fail_pick", st["id"])
+        if st["status"] == "picked" and now - st["picked_at"] > _AGENT_TASK_TIMEOUT_S:
+            st.update(running=False, status="")
+            log(f"agent_task #{st['id']} 执行超时（{int(now - st['picked_at'])}s）释放", "WARN")
+            return ("fail_timeout", st["id"])
+        return None
+
+
+# （v1 的 _agent_inject/_agent_run 已删除：pyautogui 注入在锁屏或焦点
+#  不在 WorkBuddy 时会把任务打进空气，且无法感知失败——2026-10-11 两单
+#  全丢的根因。协议取单方案见文件头注释。）
+
+
+# ---- 语音本地指令（2026-10-22）----
+# 设备控制类口令在桥接本地执行、秒级语音确认，不派给 WorkBuddy（那是
+# 秒级等待换分钟级往返，开关跟踪这种事没必要）。固件 IsComplexTask 的
+# 关键词表已同步加入这些口令（esp_claw_board.cc），命中即路由到这里。
+_TRACK_STOP_PATTERNS = (
+    "退出跟随", "退出跟踪", "停止跟随", "停止跟踪",
+    "关闭跟随", "关闭跟踪", "别跟着我", "不要跟着我",
+    "别看我", "头转回去",
+)
+
+
+def _try_local_command(text):
+    """设备控制类语音口令本地执行。命中返回语音回复文本，否则 None。"""
+    for kw in _TRACK_STOP_PATTERNS:
+        if kw in text:
+            was_on = bool(TRACK.get("enabled") or TRACK.get("active"))
+            tracking_stop_impl()  # 停跟 + 复位归位角（用户设定参数）
+            log("语音本地指令命中「%s」：%s" % (kw, text[:60]))
+            return ("好的，不跟啦，我把头转回去休息啦。"
+                    if was_on else "我本来就没有在跟呀。")
+    return None
+
+
+@app.route("/agent_task", methods=["POST"])
+def agent_task():
+    """语音任务路由落点：固件判定复杂任务后转交 WorkBuddy。
+
+      POST /agent_task   JSON {"text": 任务描述}
+      返回 {"status": "accepted"|"busy"|"rejected", ...}
+    accepted 时任务入队等待 WorkBuddy 取单（MCP 工具或看门脚本长轮询
+    /agent_task/poll），并立即推接单回执给小栗播报。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    expired = _agent_maybe_expire()
+    if expired:
+        _agent_speak_expire(expired)
+    data = request.get_json(silent=True) or {}
+    text = _agent_clip(str(data.get("text", "")), 600)
+    if not text:
+        return jsonify({"status": "rejected", "reason": "empty"}), 400
+    # 语音本地指令（2026-10-22）：设备控制类口令本地秒回，不入任务队列。
+    # 回 accepted 让固件收线小智会话，接单回执照常 ≤10s 播出。
+    local_reply = _try_local_command(text)
+    if local_reply is not None:
+        push_speak(STATE, local_reply, source="voice_local", count_daily=False)
+        return jsonify({"status": "accepted", "handled": "local"})
+    with _AGENT_LOCK:
+        if AGENT_TASK_STATE["running"]:
+            log(f"agent_task 拒绝（上一单还没取走/做完）：{text[:50]}")
+            return jsonify({"status": "busy",
+                            "reason": "上一个任务还在执行中"})
+        AGENT_TASK_STATE.update(running=True, status="queued", text=text,
+                                id=AGENT_TASK_STATE["id"] + 1,
+                                queued_at=time.time(), picked_at=0.0)
+        task_id = AGENT_TASK_STATE["id"]
+    log(f"agent_task #{task_id} 入队待取：{text[:60]}")
+    push_speak(STATE, "好的，我让 WorkBuddy 来处理这个任务，结果出来我叫你。",
+               source="agent_task", count_daily=False)
+    _AGENT_NEW_TASK.set()  # 唤醒正在长轮询的取单方
+    return jsonify({"status": "accepted", "task_id": task_id})
+
+
+@app.route("/agent_task/poll", methods=["GET"])
+def agent_task_poll():
+    """WorkBuddy 取单长轮询（MCP server / 看门脚本共用）。
+
+      GET /agent_task/poll?wait=45   最多等 wait 秒（上限 60）
+    返回 {"task": null} 或 {"task": {"id": 3, "text": "..."}}。
+    取走即置 picked，等 finish 回传；queued 超过 PICK_TTL 未取走会
+    在惰性清理里播报失败并释放。
+    """
+    if not check_token():
+        return "unauthorized", 401
+    try:
+        wait_s = max(0, min(int(request.args.get("wait", "45")), 60))
+    except ValueError:
+        wait_s = 45
+    deadline = time.time() + wait_s
+    task = None
+    while True:
+        expired = _agent_maybe_expire()
+        if expired:
+            _agent_speak_expire(expired)
+        with _AGENT_LOCK:
+            st = AGENT_TASK_STATE
+            if st["running"] and st["status"] == "queued":
+                st.update(status="picked", picked_at=time.time())
+                task = {"id": st["id"], "text": st["text"]}
+                log(f"agent_task #{st['id']} 已被 WorkBuddy 取走：{st['text'][:60]}")
+                break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        _AGENT_NEW_TASK.wait(min(remaining, 2.0))
+        _AGENT_NEW_TASK.clear()
+    return jsonify({"task": task})
+
+
+@app.route("/agent_task/finish", methods=["POST"])
+def agent_task_finish():
+    """WorkBuddy 干完活回传结果：summary 会被小栗直接播报。
+
+      POST /agent_task/finish  JSON {"task_id": 3, "summary": "播报文本",
+                                     "success": true}
+    """
+    if not check_token():
+        return "unauthorized", 401
+    expired = _agent_maybe_expire()
+    if expired:
+        _agent_speak_expire(expired)
+    data = request.get_json(silent=True) or {}
+    try:
+        task_id = int(data.get("task_id", 0))
+    except (TypeError, ValueError):
+        task_id = 0
+    summary = _agent_clip(str(data.get("summary", "")).strip(), 200)
+    success = bool(data.get("success", True))
+    with _AGENT_LOCK:
+        st = AGENT_TASK_STATE
+        matched = st["running"] and st["id"] == task_id
+        if matched:
+            st.update(running=False, status="")
+    if not matched:
+        log(f"agent_task finish #{task_id} 无匹配的在办任务", "WARN")
+        return jsonify({"ok": False, "reason": "no matching outstanding task"})
+    if not summary:
+        summary = "任务完成了。" if success else "抱歉，这个任务没做成。"
+    log(f"agent_task #{task_id} 完成（success={success}）：{summary[:60]}")
+    push_speak(STATE, summary, source="agent_task", count_daily=False)
+    return jsonify({"ok": True})
+
+
+def _agent_speak_expire(expired):
+    kind, _tid = expired
+    msg = ("WorkBuddy 这会儿没接单，任务先放下了，你可以再说一次试试。"
+           if kind == "fail_pick" else
+           "WorkBuddy 那边的任务做超时了，这一单先放下。")
+    push_speak(STATE, msg, source="agent_task", count_daily=False)
+
+
+# ============================================================
+# 人脸跟踪（2026-10-14 舵机云台 v1）
+# 设备把摄像头装在 SG90 摆臂上，以 3-4fps 上传 X-Photo-Type: track 帧；
+# 本端跑 YuNet 找最大人脸的水平偏移，比例控制折算成目标角度，
+# 随 /vision 响应回传 {"servo": 角度}——一帧一闭环，无需额外控制通道。
+# 开关经 pending 队列下发（/tracking/start|stop → 设备 /pending 领单）。
+# ============================================================
+_track_lock = threading.Lock()
+TRACK = {
+    "enabled": False,
+    "active": False,      # 设备端是否真在跟（2026-10-16 待机机制：丢脸超时→False）
+    "angle": 90,          # 当前目标水平角度（桥接维护，帧间平滑）
+    "tilt": 90,           # 当前目标俯仰角度（2026-10-16 二维云台）
+    "last_face_ts": 0.0,  # 最近一次见到人脸的时刻（丢脸超时回中用）
+    "last_frame_ts": 0.0,
+    "frames": 0,
+    "face_frames": 0,
+    "start_ts": None,
+    # ---- 安全保障（2026-10-21，俯仰舵机烧毁事故配套）----
+    "pin_pan": None,      # 水平轴限位钉死计时 {"since": ts, "dir": "+"/"-"}
+    "pin_tilt": None,     # 俯仰轴限位钉死计时
+    "breaker": None,      # 熔断记录 {"reason","count","lockout","ts"}
+    "trip_count": 0,      # 连续熔断次数（10 分钟窗口内累计，/tracking/start 清零）
+    "last_trip_ts": 0.0,  # 上次熔断时刻（自动重启冷却用）
+    "owner_sim": None,    # 当前跟踪目标的主人识别相似度（follow_owner_only）
+    "target": None,       # 目标锁定：当前跟的脸中心（归一化），防多人在场来回跳
+}
+
+
+def _safety_cfg():
+    """舵机安全保护参数（2026-10-21）"""
+    return {
+        # 目标角连续钉死限位超过该秒数 → 判定疑似堵转，熔断停跟踪
+        "stall_limit_s": float(cfg("tracking", "stall_limit_s", default=10.0)),
+        # 手动 /servo 指令是否夹到软限位内（标定时可临时关）
+        "servo_clamp": bool(cfg("tracking", "servo_clamp", default=True)),
+        # 熔断时是否语音播报告警
+        "safety_speak": bool(cfg("tracking", "safety_speak", default=True)),
+        # 熔断后自动重启冷却（秒）：给瞬态原因消散的时间，防重启即熔断连击
+        "restart_cooldown_s": float(cfg("tracking", "restart_cooldown_s",
+                                        default=60.0)),
+        # 10 分钟内连续熔断达到该次数 → 锁死，不再自动恢复，需手动重启
+        "trip_lockout": int(cfg("tracking", "trip_lockout", default=3)),
+        # 跟踪只跟主人脸（SFace 验身份）
+        "follow_owner_only": bool(cfg("tracking", "follow_owner_only",
+                                      default=True)),
+    }
+
+
+def _pin_update(key, direction):
+    """限位钉死连击计时：direction 为空=本帧未钉死（清零）；
+    返回已连续钉死的秒数（未钉死返回 0）。"""
+    now = time.time()
+    st = TRACK.get(key)
+    if not direction:
+        TRACK[key] = None
+        return 0.0
+    if not st or st.get("dir") != direction:
+        TRACK[key] = {"since": now, "dir": direction}
+        return 0.0
+    return now - st["since"]
+
+
+def _trip_breaker(axis, direction, duration):
+    """舵机堵转熔断（2026-10-21）：停跟踪 + 回安全姿态 + 告警。
+
+    两级设计（2026-10-21 用户定稿）：归位角就是对着座位的视角，回正后
+    要靠在座判定看到主人回来才能自动重启跟踪——所以熔断默认**不**关掉
+    自动恢复：
+    - 软熔断（连续 <3 次）：停跟踪回正，tracking_enabled 保持开 →
+      在座判定看到主人回来自动重启（60s 冷却）。每次堵转被熔断限制在
+      ≤10s 且随即回正卸力，单次无害。
+    - 锁死（10 分钟内连续 3 次熔断 = 硬件性故障特征，如舵盘打滑/卡死）：
+      tracking_enabled 持久化关，不再自动恢复，必须手动 /tracking/start。
+    事故背景（2026-10-18 俯仰舵机烧毁）：舵盘在输出轴打滑产生恒定偏差 →
+    闭环永远追不中 → 目标角被顶死在限位 → 满电流堵转 ~4 分钟 → 烧机。
+    """
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    now = time.time()
+    last = TRACK.get("last_trip_ts") or 0.0
+    count = TRACK.get("trip_count") or 0
+    count = count + 1 if (last and now - last < 600) else 1
+    lockout = count >= sc["trip_lockout"]
+    TRACK["trip_count"] = count
+    TRACK["last_trip_ts"] = now
+    TRACK["active"] = False
+    TRACK["breaker"] = {
+        "reason": "stall_%s" % axis,
+        "count": count,
+        "lockout": lockout,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+    if lockout:
+        TRACK["enabled"] = False
+        with _state_lock:
+            STATE["tracking_enabled"] = False  # 持久化：重启后也不自动恢复
+            save_state(STATE)
+    _push_pending_command("tracking", "off")
+    # 清零钉死计时：连续熔断按"故障回合"计（每回合都要重新钉满 10s），
+    # 否则帧流还在时会按帧连击，1 秒内凑满 3 次误锁死（2026-10-21 实录）
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["target"] = None
+    # 回归安全姿态=归位视角（与待机回中同一组角度）：既让舵机离开限位
+    # 解除堵转受力，又让摄像头对准座位，供在座判定自动重启
+    _push_pending_command("servo", "%d,%d" % (tc["home_pan"], tc["home_tilt"]))
+    detail = ("%s 轴目标角钉死限位（方向 %s）超过 %.0fs，疑似堵转/舵盘打滑/"
+              "结构件卡死。已停跟踪并回正（pan=%d tilt=%d）。"
+              % (axis, direction, duration, tc["home_pan"], tc["home_tilt"]))
+    if lockout:
+        log("舵机安全保护【锁死】：%s10 分钟内第 %d 次熔断，判定为持续性硬件"
+            "故障，不再自动恢复；确认硬件正常后请用 Dashboard 或 "
+            "POST /tracking/start 手动重启。" % (detail, count), "ERROR")
+        speak_msg = ("主人，舵机连续三次保护触发，跟踪已锁死，快来检查一下云台。")
+    else:
+        log("舵机安全保护触发（第 %d/%d 次）：%s%.0f 秒后冷却结束，"
+            "看到主人回座会自动重启跟踪。"
+            % (count, sc["trip_lockout"], detail, sc["restart_cooldown_s"]),
+            "ERROR")
+        speak_msg = "主人，舵机保护触发了，我先回正休息一下，你坐好了我再接着看你。"
+    if sc["safety_speak"]:
+        try:
+            push_speak(STATE, speak_msg, source="safety", count_daily=False)
+        except Exception as exc:
+            log("安全告警播报入队失败: %s" % exc, "WARN")
+    if cfg("notify", "feishu", default=True):
+        threading.Thread(target=notify_feishu,
+                         args=("🚨 小栗舵机安全告警\n" + detail,),
+                         daemon=True).start()
+
+
+def _safety_startup_check():
+    """启动自检（2026-10-21）：软限位必须包住归位姿态，否则跟踪一开环
+    就会把舵机往限位顶。有问题返回 False，调用方应拒绝自动恢复跟踪。"""
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    problems = []
+    if not tc["min_angle"] < tc["home_pan"] < tc["max_angle"]:
+        problems.append("水平: home_pan=%d 不在行程 [%d, %d] 内"
+                        % (tc["home_pan"], tc["min_angle"], tc["max_angle"]))
+    if not tc["tilt_min_angle"] < tc["home_tilt"] < tc["tilt_max_angle"]:
+        problems.append("俯仰: home_tilt=%d 不在行程 [%d, %d] 内"
+                        % (tc["home_tilt"], tc["tilt_min_angle"],
+                           tc["tilt_max_angle"]))
+    for p in problems:
+        log("舵机安全自检不通过：" + p, "ERROR")
+    log("舵机安全保护：堵转熔断 %.0fs / 手动指令限幅 %s / 水平行程 [%d, %d] / "
+        "俯仰行程 [%d, %d]"
+        % (sc["stall_limit_s"], "开" if sc["servo_clamp"] else "关",
+           tc["min_angle"], tc["max_angle"],
+           tc["tilt_min_angle"], tc["tilt_max_angle"]))
+    return not problems
+
+
+def _track_cfg():
+    return {
+        "gain": float(cfg("tracking", "gain", default=14.0)),
+        "max_step": float(cfg("tracking", "max_step", default=10.0)),
+        "deadband": float(cfg("tracking", "deadband", default=0.06)),
+        "min_angle": int(cfg("tracking", "min_angle", default=40)),
+        "max_angle": int(cfg("tracking", "max_angle", default=140)),
+        "return_delay": float(cfg("tracking", "return_delay_s", default=5.0)),
+        # 待机（2026-10-16 用户方案）：持续丢脸超过该秒数就停掉跟踪回中，
+        # 由在座判定负责看到主人回来再自动重启
+        "standby_delay": float(cfg("tracking", "standby_delay_s", default=30.0)),
+        # 归位姿态（2026-10-17 用户定）：丢脸回中/待机的目标角度，
+        # 与固件 CLAW_SERVO_HOME_PAN/TILT 保持一致
+        # 2026-10-23 起 Dashboard 可改（state.json 覆盖层优先，config.yaml
+        # 作默认值）——cfg() 是启动缓存，改 yaml 必须重启，覆盖层免重启。
+        "home_pan": int((STATE.get("tracking_home") or {}).get(
+            "pan", cfg("tracking", "home_pan", default=100))),
+        "home_tilt": int((STATE.get("tracking_home") or {}).get(
+            "tilt", cfg("tracking", "home_tilt", default=110))),
+        "flip": bool(cfg("tracking", "flip", default=False)),
+        # 俯仰轴（2026-10-16 二维云台）：脸在画面下方 → 摄像头低头；
+        # 方向装反改 tilt_flip。俯仰行程默认 60-120，防撞云台结构件。
+        "tilt_gain": float(cfg("tracking", "tilt_gain", default=12.0)),
+        "tilt_flip": bool(cfg("tracking", "tilt_flip", default=False)),
+        "tilt_min_angle": int(cfg("tracking", "tilt_min_angle", default=60)),
+        "tilt_max_angle": int(cfg("tracking", "tilt_max_angle", default=120)),
+        # 只跟主人脸（2026-10-22）：跟踪目标必须过 SFace 验身份，防主人
+        # 离开后追着隔壁桌同事走。SFace 模型不可用时退回旧逻辑（跟最大脸）
+        "follow_owner_only": bool(cfg("tracking", "follow_owner_only",
+                                      default=True)),
+    }
+
+
+def tracking_compute_angle(image_bytes):
+    """对一帧 track 照片跑 YuNet，返回 (水平角度, 俯仰角度)（带锁串行化）。"""
+    import cv2
+    import numpy as np
+
+    tc = _track_cfg()
+    now = time.time()
+    with _track_lock:
+        # 非 active 期间（待机/熔断回正/已停）闭环短路：任何残留 track 帧
+        # 只回归位角。防钉死角度继续下发、与回正指令打架（2026-10-21 修）。
+        if not TRACK.get("active"):
+            angle = int(max(tc["min_angle"],
+                            min(tc["max_angle"], tc["home_pan"])))
+            tilt = int(max(tc["tilt_min_angle"],
+                           min(tc["tilt_max_angle"], tc["home_tilt"])))
+            TRACK["angle"] = angle
+            TRACK["tilt"] = tilt
+            TRACK["last_frame_ts"] = now
+            return angle, tilt
+        angle = TRACK["angle"]
+        tilt = TRACK["tilt"]
+        if _init_opencv() and _yunet is not None:
+            arr = np.frombuffer(image_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                _yunet.setInputSize((w, h))
+                result = _yunet.detect(img)
+                dets = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+                d = None
+                if dets is not None and len(dets):
+                    # 选跟踪目标。默认最大脸（离得最近的人）；
+                    # follow_owner_only（2026-10-22 用户反馈"我不在时它追
+                    # 隔壁桌同事"——原逻辑不验身份，主人一走就跟着别人转）
+                    # 开启时只跟 SFace 认出的主人脸：按脸大小降序最多验
+                    # 3 张控制 CPU 开销，全都认不出 → 视同丢脸，走回正待机
+                    d = max(dets, key=lambda r: float(r[2]) * float(r[3]))
+                    if tc["follow_owner_only"] and _sface is not None \
+                            and _user_templates is not None:
+                        thr = float(cfg("vision", "recog_threshold",
+                                        default=0.363))
+                        # 迟滞门槛（2026-10-22 访客在场来回跳的修复）：已锁定
+                        # 的目标过 thr 就继续跟；重新获取目标必须过更高门槛，
+                        # 防陌生人 0.38 量级的误匹配抢走跟踪
+                        acquire_thr = float(cfg(
+                            "tracking", "recog_acquire_threshold",
+                            default=0.45))
+                        min_px = float(cfg("vision", "recog_min_face_px",
+                                           default=60))
+                        ranked = sorted(
+                            dets, key=lambda r: float(r[2]) * float(r[3]),
+                            reverse=True)[:3]
+                        # 隔帧识别（2026-10-23）：SFace 每张脸 ~15-20ms，3fps
+                        # 闭环里占掉约 10% 帧预算。改为隔帧验身份，中间帧用
+                        # 目标锁定位置补间（0.12 半径内就近认领），平均省一半。
+                        tick = (TRACK.get("recog_tick") or 0) + 1
+                        TRACK["recog_tick"] = tick
+                        tgt_now = TRACK.get("target")
+                        do_recog = (tick % 2 == 1) or (tgt_now is None)
+                        d = None
+                        best = None
+                        if do_recog:
+                            owner_hits = []  # (sim, cand)
+                            for cand in ranked:
+                                if float(cand[2]) < min_px:
+                                    continue  # 脸太小特征不可靠，跳过
+                                try:
+                                    aligned = _sface.alignCrop(img, cand)
+                                    feat = np.asarray(_sface.feature(aligned),
+                                                      dtype=np.float32).reshape(-1)
+                                    best = max(_cosine_sim(feat, t)
+                                               for t in _user_templates)
+                                except Exception:  # noqa: BLE001
+                                    continue
+                                if best >= thr:
+                                    owner_hits.append((best, cand))
+                            best = None
+                            if owner_hits:
+                                tgt = TRACK.get("target")
+                                if tgt:
+                                    # 目标锁定：优先跟上一帧锁定的那张脸
+                                    # （中心位置最近者），而不是每帧全局重选
+                                    def _dist(c):
+                                        cxn = (float(c[0]) + float(c[2]) / 2.0) / w
+                                        cyn = (float(c[1]) + float(c[3]) / 2.0) / h
+                                        return ((cxn - tgt["cx"]) ** 2
+                                                + (cyn - tgt["cy"]) ** 2) ** 0.5
+                                    sim0, cand0 = min(owner_hits,
+                                                      key=lambda t: _dist(t[1]))
+                                    if _dist(cand0) <= 0.3:
+                                        d, best = cand0, sim0
+                                if d is None:
+                                    # 无锁定/锁定丢失：重新获取，用高门槛挑最像的
+                                    strong = [t for t in owner_hits
+                                              if t[0] >= acquire_thr]
+                                    if strong:
+                                        # 2026-10-27：连续 2 帧都过门槛才确认，
+                                        # 单帧擦线误匹配（路过的人）拿不走跟踪
+                                        streak = (TRACK.get("acq_streak")
+                                                  or 0) + 1
+                                        TRACK["acq_streak"] = streak
+                                        if streak >= 2:
+                                            best, d = max(strong,
+                                                          key=lambda t: t[0])
+                                            TRACK["acq_streak"] = 0
+                                    else:
+                                        TRACK["acq_streak"] = 0
+                        else:
+                            # 补间帧：不跑 SFace，离锁定点 0.12 内最近的脸
+                            # 视为同一目标（下一帧仍会验身份纠错）
+                            best_cand, best_dist = None, 1e9
+                            for cand in ranked:
+                                cxn = (float(cand[0]) + float(cand[2]) / 2.0) / w
+                                cyn = (float(cand[1]) + float(cand[3]) / 2.0) / h
+                                dist = ((cxn - tgt_now["cx"]) ** 2
+                                        + (cyn - tgt_now["cy"]) ** 2) ** 0.5
+                                if dist < best_dist:
+                                    best_cand, best_dist = cand, dist
+                            if best_cand is not None and best_dist <= 0.12:
+                                d = best_cand
+                                best = TRACK.get("owner_sim") or thr
+                        if d is not None:
+                            TRACK["owner_sim"] = round(best, 3)
+                            TRACK["target"] = {
+                                "cx": (float(d[0]) + float(d[2]) / 2.0) / w,
+                                "cy": (float(d[1]) + float(d[3]) / 2.0) / h,
+                            }
+                        else:
+                            TRACK["owner_sim"] = None
+                            TRACK["target"] = None
+                if d is not None:
+                    cx = float(d[0]) + float(d[2]) / 2.0
+                    cy = float(d[1]) + float(d[3]) / 2.0
+                    offset = (cx - w / 2.0) / (w / 2.0)  # -1.0 .. 1.0
+                    if tc["flip"]:
+                        offset = -offset
+                    if abs(offset) > tc["deadband"]:
+                        step = max(-tc["max_step"],
+                                   min(tc["max_step"], offset * tc["gain"]))
+                        angle += step
+                    # 俯仰：脸偏下（cy > h/2）→ offset_y > 0 → 低头
+                    offset_y = (cy - h / 2.0) / (h / 2.0)
+                    if tc["tilt_flip"]:
+                        offset_y = -offset_y
+                    if abs(offset_y) > tc["deadband"]:
+                        step_y = max(-tc["max_step"],
+                                     min(tc["max_step"], offset_y * tc["tilt_gain"]))
+                        tilt += step_y
+                    TRACK["last_face_ts"] = now
+                    TRACK["face_frames"] += 1
+                elif TRACK["last_face_ts"] and \
+                        now - TRACK["last_face_ts"] > tc["return_delay"]:
+                    # 丢脸超时：每帧双轴各回 2°，滑向归位姿态（默认 pan100/tilt80）
+                    hp, ht = tc["home_pan"], tc["home_tilt"]
+                    if angle > hp:
+                        angle = max(float(hp), angle - 2)
+                    elif angle < hp:
+                        angle = min(float(hp), angle + 2)
+                    if tilt > ht:
+                        tilt = max(float(ht), tilt - 2)
+                    elif tilt < ht:
+                        tilt = min(float(ht), tilt + 2)
+                    # 待机（2026-10-16 用户方案）：丢脸超过 standby_delay，
+                    # 停掉跟踪回中省电，交给在座判定负责唤醒
+                    if TRACK.get("active") and \
+                            now - TRACK["last_face_ts"] > tc["standby_delay"]:
+                        TRACK["active"] = False
+                        _push_pending_command("tracking", "off")
+                        log("人脸跟踪：持续未见人脸 %.0fs，转待机回中"
+                            "（在座判定看到主人回来会自动重启）"
+                            % (now - TRACK["last_face_ts"]), "WARN")
+        # ---- 安全保障（2026-10-21）：限位钉死检测 ----
+        # 限幅前的目标角越过软限位且持续 stall_limit_s → 疑似堵转（舵盘打滑/
+        # 结构件顶死/舵机失效），熔断停跟踪。正常跟踪脸居中后即退出钉死，
+        # 不会误触发；真被顶住时 10s 内断闭环，远短于烧机所需的分钟级堵转。
+        sc = _safety_cfg()
+        pin_p = ("+" if angle > tc["max_angle"] + 0.3
+                 else "-" if angle < tc["min_angle"] - 0.3 else "")
+        pin_t = ("+" if tilt > tc["tilt_max_angle"] + 0.3
+                 else "-" if tilt < tc["tilt_min_angle"] - 0.3 else "")
+        dur_p = _pin_update("pin_pan", pin_p)
+        dur_t = _pin_update("pin_tilt", pin_t)
+        if dur_p >= sc["stall_limit_s"]:
+            _trip_breaker("pan", pin_p, dur_p)
+        elif dur_t >= sc["stall_limit_s"]:
+            _trip_breaker("tilt", pin_t, dur_t)
+
+        angle = int(max(tc["min_angle"],
+                        min(tc["max_angle"], round(angle))))
+        tilt = int(max(tc["tilt_min_angle"],
+                       min(tc["tilt_max_angle"], round(tilt))))
+        TRACK["angle"] = angle
+        TRACK["tilt"] = tilt
+        TRACK["frames"] += 1
+        TRACK["last_frame_ts"] = now
+        return angle, tilt
+
+
+def _push_pending_command(ctype, message):
+    """往 pending 队列塞一条设备指令（跟踪开关等非播报类）。"""
+    with _state_lock:
+        if len(STATE.get("pending", [])) >= 20:
+            log("pending 队列已满，指令丢弃", "WARN")
+            return False
+        STATE["pending"].append({
+            "type": ctype,
+            "message": message,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+    return True
+
+
+def _push_servo_preview(pan, tilt):
+    """Dashboard 拖滑杆时的角度预览（2026-10-23）。
+
+    先清掉队列里还没被设备领走的 servo 指令，再压一条最新的——
+    否则拖动几秒会积一串过时角度，设备按序执行时头会来回甩。
+    """
+    with _state_lock:
+        STATE["pending"] = [p for p in STATE.get("pending", [])
+                            if p.get("type") != "servo"]
+    return _push_pending_command("servo", "%d,%d" % (pan, tilt))
+
+
+@app.route("/tracking/start", methods=["POST"])
+def tracking_start():
+    tc = _track_cfg()
+    TRACK["enabled"] = True
+    TRACK["active"] = True
+    TRACK["angle"] = tc["home_pan"]
+    TRACK["tilt"] = tc["home_tilt"]
+    TRACK["last_face_ts"] = 0.0
+    TRACK["last_frame_ts"] = time.time()  # 保活基准：给首帧 90s 宽限，不立即补发
+    TRACK["frames"] = 0
+    TRACK["face_frames"] = 0
+    TRACK["start_ts"] = datetime.now().isoformat(timespec="seconds")
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["trip_count"] = 0
+    TRACK["last_trip_ts"] = 0.0
+    TRACK["breaker"] = None  # 手动开启视为已确认硬件正常，清除熔断记录
+    with _state_lock:
+        STATE["tracking_enabled"] = True  # 持久化：桥接重启后自动恢复
+        save_state(STATE)
+    ok = _push_pending_command("tracking", "on")
+    log("人脸跟踪：已开启" + ("，指令已下发" if ok else "（pending 队列满，稍后设备重试领取期间照常工作会延迟）"))
+    return jsonify({"ok": True, "queued": ok})
+
+
+def tracking_stop_impl():
+    """停跟踪并复位到归位姿态（用户语音口令 / 手动停止共用）。
+
+    2026-10-22 用户要求：退出跟踪后舵机必须回到设定参数（home_pan/
+    home_tilt，即对着座位的视角），不能停在最后跟踪角度。
+    """
+    tc = _track_cfg()
+    TRACK["enabled"] = False
+    TRACK["active"] = False
+    TRACK["pin_pan"] = None
+    TRACK["pin_tilt"] = None
+    TRACK["target"] = None
+    TRACK["angle"] = tc["home_pan"]
+    TRACK["tilt"] = tc["home_tilt"]
+    with _state_lock:
+        STATE["tracking_enabled"] = False  # 持久化：桥接重启后不再自动恢复
+        save_state(STATE)
+    _push_pending_command("tracking", "off")
+    # 复位归位姿态：先 off 停跟（设备收线断流），随后 servo 指令转回归位角
+    _push_pending_command("servo", "%d,%d" % (tc["home_pan"], tc["home_tilt"]))
+
+
+@app.route("/tracking/stop", methods=["POST"])
+def tracking_stop():
+    tracking_stop_impl()
+    log("人脸跟踪：已停止并复位归位（pan=%d tilt=%d）"
+        % (_track_cfg()["home_pan"], _track_cfg()["home_tilt"]))
+    return jsonify({"ok": True, "homed": True})
+
+
+def _tracking_keepalive():
+    """跟踪保活 + 待机探测（2026-10-16）。
+
+    - active（设备在跟）：>90s 无 track 帧（正常时无脸也持续传帧，无帧=
+      跟踪停了或掉线，如 track_fail>8 自动停 / 设备重启）→ 补发 "on"；
+      设备端重复收到 "on" 是 no-op，正在跟时无副作用。
+    - 待机（丢脸超时已停，等在座判定唤醒）：每 2 分钟兜底塞一张拍照单，
+      加速在座判定。哨兵"回归"事件本来就会立即派复核照（秒级），这里
+      只是哨兵没触发时的兜底。
+    """
+    tick = 0
+    while True:
+        time.sleep(30)
+        tick += 1
+        try:
+            if not TRACK.get("enabled"):
+                continue
+            if not TRACK.get("active"):
+                if tick % 4 != 0:
+                    continue
+                with _state_lock:
+                    has = any(p.get("type") == "photo"
+                              for p in STATE.get("pending", []))
+                if not has:
+                    _request_verify_photo()
+                continue
+            last = TRACK.get("last_frame_ts", 0.0)
+            if last and (time.time() - last) < 90:
+                continue
+            with _state_lock:
+                already = any(p.get("type") == "tracking" and p.get("message") == "on"
+                              for p in STATE.get("pending", []))
+            if already:
+                continue  # 等设备来领取，别刷队列
+            if _push_pending_command("tracking", "on"):
+                log("跟踪保活：超过 90s 未收到 track 帧，已补发开启指令", "WARN")
+        except Exception as exc:
+            log("跟踪保活异常: %s" % exc, "WARN")
+
+
+# ---- 跟踪视频流通道（2026-10-17）----
+# 此前跟踪帧逐帧 POST /vision，每帧重建 TCP 连接 + HTTP/multipart 开销把
+# 帧率压在 2-3fps。改为设备在一条常连接上连续推帧：
+#   协议：4 字节小端帧长 + JPEG 字节；应答 ASCII "pan,tilt\n"。
+#   跟踪已关时回 "off\n"，设备收到即自停（省 pending 队列一来一回）。
+
+_TRACK_STREAM_MAX = 500_000  # 帧长上限，防异常长度打爆内存
+
+
+def _recv_exact(conn, n):
+    """收满 n 字节；对端断开返回 None。"""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _track_stream_client(conn, addr):
+    conn.settimeout(3.0)
+    try:
+        # 关 Nagle（2026-10-23）：每帧应答只有 "pan,tilt\n" 十来个字节，
+        # 默认 Nagle 会等 ACK 再发，小包往返平白多几十毫秒；跟踪闭环里
+        # 每一帧都要付这笔账，是"一卡一卡"的隐性成本之一。
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        while True:
+            head = _recv_exact(conn, 4)
+            if head is None:
+                return
+            (length,) = struct.unpack("<I", head)
+            if length == 0 or length > _TRACK_STREAM_MAX:
+                log(f"track流：{addr} 非法帧长度 {length}，断开", "WARN")
+                return
+            jpeg = _recv_exact(conn, length)
+            if jpeg is None:
+                return
+            if not TRACK.get("enabled") or not TRACK.get("active"):
+                # 关闭/待机/熔断回正期间都回 off：设备收到即自停，
+                # 不再继续推帧（2026-10-21 修：此前只看 enabled，软熔断后
+                # 设备继续跟，钉死计时连击导致 1 秒内误锁死）
+                conn.sendall(b"off\n")
+                continue
+            _t0 = time.time()
+            angle, tilt = tracking_compute_angle(jpeg)
+            log(f"track流: {len(jpeg)//1024}KB 桥接处理{(time.time()-_t0)*1000:.0f}ms "
+                f"-> pan={angle} tilt={tilt}")
+            conn.sendall(("%d,%d\n" % (angle, tilt)).encode())
+    except (OSError, socket.timeout) as exc:
+        log(f"track流：{addr} 连接断开（{exc.__class__.__name__}）")
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _track_stream_server():
+    port = int(cfg("tracking", "stream_port", default=8789))
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(2)
+    log(f"跟踪视频流端口：{port}")
+    while True:
+        try:
+            conn, addr = srv.accept()
+        except OSError:
+            time.sleep(1)
+            continue
+        threading.Thread(target=_track_stream_client, args=(conn, addr),
+                         daemon=True, name="track-stream").start()
+
+
+@app.route("/servo", methods=["POST"])
+def servo_set_angle():
+    """直接设舵机角度（2026-10-16）：/servo?angle=N[&tilt=M] 或 JSON
+    {"angle": N, "tilt": M}。经 pending 队列下发，msg = "h" 或 "h,v"。"""
+    angle = request.values.get("angle", type=int)
+    if angle is None:
+        body = request.get_json(silent=True) or {}
+        try:
+            angle = int(body.get("angle"))
+        except (TypeError, ValueError):
+            angle = None
+    tilt = request.values.get("tilt", type=int)
+    if tilt is None:
+        body = request.get_json(silent=True) or {}
+        try:
+            tilt = int(body.get("tilt"))
+        except (TypeError, ValueError):
+            tilt = None
+    if angle is None or not 0 <= angle <= 180:
+        return jsonify({"ok": False, "error": "angle must be 0-180"}), 400
+    if tilt is not None and not 0 <= tilt <= 180:
+        return jsonify({"ok": False, "error": "tilt must be 0-180"}), 400
+    # ---- 安全限幅（2026-10-21）：手动指令也夹到软限位内，防误操作顶死舵机。
+    # 标定行程时可在 config.yaml 设 tracking.servo_clamp=false 临时放开。----
+    clamped = {}
+    if cfg("tracking", "servo_clamp", default=True):
+        tc = _track_cfg()
+        ca = max(tc["min_angle"], min(tc["max_angle"], angle))
+        if ca != angle:
+            clamped["angle"] = [angle, ca]
+            log(f"舵机安全限幅：水平 {angle}° → {ca}°（软限位 "
+                f"{tc['min_angle']}~{tc['max_angle']}）", "WARN")
+            angle = ca
+        if tilt is not None:
+            ct = max(tc["tilt_min_angle"], min(tc["tilt_max_angle"], tilt))
+            if ct != tilt:
+                clamped["tilt"] = [tilt, ct]
+                log(f"舵机安全限幅：俯仰 {tilt}° → {ct}°（软限位 "
+                    f"{tc['tilt_min_angle']}~{tc['tilt_max_angle']}）", "WARN")
+                tilt = ct
+    msg = str(angle) if tilt is None else f"{angle},{tilt}"
+    ok = _push_pending_command("servo", msg)
+    log(f"舵机：下发角度 {angle}°" +
+        (f" 俯仰 {tilt}°" if tilt is not None else "") +
+        ("" if ok else "（队列满）"))
+    return jsonify({"ok": True, "angle": angle, "tilt": tilt,
+                    "clamped": clamped or None, "queued": ok})
+
+
+@app.route("/tracking/status", methods=["GET"])
+def tracking_status():
+    age = (time.time() - TRACK["last_face_ts"]) if TRACK["last_face_ts"] else None
+    sc = _safety_cfg()
+
+    def _pin(key):
+        st = TRACK.get(key)
+        if not st:
+            return None
+        return {"dir": st.get("dir"),
+                "seconds": round(time.time() - st["since"], 1)}
+    return jsonify({
+        "enabled": TRACK["enabled"],
+        "active": TRACK.get("active"),
+        "angle": TRACK["angle"],
+        "tilt": TRACK.get("tilt"),
+        "frames": TRACK["frames"],
+        "face_frames": TRACK["face_frames"],
+        "face_age_s": round(age, 1) if age is not None else None,
+        "start_ts": TRACK["start_ts"],
+        # 安全保障状态（2026-10-21）
+        "breaker": TRACK.get("breaker"),
+        "trip_count": TRACK.get("trip_count", 0),
+        "pin_pan": _pin("pin_pan"),
+        "pin_tilt": _pin("pin_tilt"),
+        "stall_limit_s": sc["stall_limit_s"],
+        "servo_clamp": sc["servo_clamp"],
+        "restart_cooldown_s": sc["restart_cooldown_s"],
+        "trip_lockout": sc["trip_lockout"],
+        "owner_sim": TRACK.get("owner_sim"),
+        "follow_owner_only": sc["follow_owner_only"],
+    })
+
+
+@app.route("/api/dashboard/tracking", methods=["GET"])
+def dashboard_tracking_get():
+    """Dashboard「人脸跟踪」页：状态汇总（2026-10-23）"""
+    tc = _track_cfg()
+    sc = _safety_cfg()
+    with _state_lock:
+        has_override = bool(STATE.get("tracking_home"))
+    return jsonify({
+        "ok": True,
+        "enabled": TRACK["enabled"],
+        "active": TRACK.get("active"),
+        "angle": TRACK["angle"],
+        "tilt": TRACK.get("tilt"),
+        "owner_sim": TRACK.get("owner_sim"),
+        "breaker": TRACK.get("breaker"),
+        "trip_count": TRACK.get("trip_count", 0),
+        "home_pan": tc["home_pan"],
+        "home_tilt": tc["home_tilt"],
+        "home_source": "dashboard" if has_override else "config",
+        "limits": {"pan": [tc["min_angle"], tc["max_angle"]],
+                   "tilt": [tc["tilt_min_angle"], tc["tilt_max_angle"]]},
+        "templates": 0 if _user_templates is None
+        else int(len(_user_templates)),
+        "follow_owner_only": sc["follow_owner_only"],
+    })
+
+
+@app.route("/api/dashboard/tracking", methods=["POST"])
+def dashboard_tracking_save():
+    """保存或预览回位角度（2026-10-23）。
+
+    {"home_pan": 100, "home_tilt": 110, "preview": false}
+    - preview=true：只让头转过去（跟踪没在跟时），不落盘
+    - 否则：写 state.json 覆盖层，立即生效免重启
+    """
+    data = request.get_json(silent=True) or {}
+    # 一键恢复 config.yaml 默认值（2026-10-23）：清掉 state.json 覆盖层
+    if data.get("reset"):
+        with _state_lock:
+            STATE.pop("tracking_home", None)
+            save_state(STATE)
+        tc = _track_cfg()
+        log("回位角度已恢复 config.yaml 默认：pan=%d tilt=%d"
+            % (tc["home_pan"], tc["home_tilt"]))
+        return jsonify({"ok": True, "reset": True,
+                        "home_pan": tc["home_pan"],
+                        "home_tilt": tc["home_tilt"], "saved": True})
+    tc = _track_cfg()
+    try:
+        pan = int(data.get("home_pan", tc["home_pan"]))
+        tilt = int(data.get("home_tilt", tc["home_tilt"]))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "角度必须是整数"}), 400
+    # 必须严格落在软限位内且离边 ≥2°（启动自检同口径，防一开跟踪就顶死）
+    p_lo, p_hi = tc["min_angle"] + 2, tc["max_angle"] - 2
+    t_lo, t_hi = tc["tilt_min_angle"] + 2, tc["tilt_max_angle"] - 2
+    if not p_lo <= pan <= p_hi:
+        return jsonify({"ok": False,
+                        "error": f"水平回位角需在 {p_lo}~{p_hi} 之间"}), 400
+    if not t_lo <= tilt <= t_hi:
+        return jsonify({"ok": False,
+                        "error": f"俯仰回位角需在 {t_lo}~{t_hi} 之间"}), 400
+    preview = bool(data.get("preview"))
+    if not preview:
+        with _state_lock:
+            STATE["tracking_home"] = {"pan": pan, "tilt": tilt}
+            save_state(STATE)
+        log("回位角度已更新（Dashboard）：pan=%d tilt=%d" % (pan, tilt))
+    moved = False
+    if preview and not TRACK.get("active"):
+        # 只在跟踪没在跟时预览转头（2026-10-23 用户定稿：跟踪期间滑杆
+        # 只改数值不抢舵机——头该跟着人走，不该跟着滑杆走）
+        moved = _push_servo_preview(pan, tilt)
+    return jsonify({"ok": True, "home_pan": pan, "home_tilt": tilt,
+                    "saved": not preview, "servo_preview": moved,
+                    "tracking_active": bool(TRACK.get("active"))})
+
+
+@app.route("/api/dashboard/tracking/enroll", methods=["POST"])
+def dashboard_tracking_enroll():
+    """Dashboard 直接注册主人脸（2026-10-23）：multipart file= 或原始 JPEG。
+    ?replace=1 清空重注册。参考照落盘 data/owner_ref.jpg 供页面回显。"""
+    file_obj = request.files.get("file")
+    image_bytes = file_obj.read() if file_obj is not None else request.get_data()
+    if not image_bytes:
+        return jsonify({"ok": False, "error": "没有收到照片"}), 400
+    replace = (str(request.form.get("replace", "")).lower()
+               in ("1", "true", "yes")) or \
+        (request.args.get("replace") in ("1", "true", "yes"))
+    ok, info = _enroll_owner_face(image_bytes, replace=replace)
+    if not ok:
+        return jsonify({"ok": False, "error": str(info)}), 400
+    try:
+        OWNER_REF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OWNER_REF_FILE.write_bytes(image_bytes)
+    except OSError as exc:
+        log("参考照落盘失败：%s" % exc, "WARN")
+    log("Dashboard 注册主人脸：模板 %d 张%s"
+        % (info["templates"], "（已清空重注册）" if replace else "（追加）"))
+    return jsonify({"ok": True, "templates": info["templates"],
+                    "self_sim": info["self_sim"], "replaced": replace,
+                    "ref_url": "/api/dashboard/tracking/ref.jpg?t=%d"
+                    % int(time.time())})
+
+
+@app.route("/api/dashboard/tracking/ref.jpg", methods=["GET"])
+def dashboard_tracking_ref():
+    if not OWNER_REF_FILE.exists():
+        return "", 404
+    return send_file(str(OWNER_REF_FILE), mimetype="image/jpeg")
+
+
 @app.route("/vision", methods=["POST"])
 def vision():
     """
@@ -1550,6 +2869,17 @@ def vision():
                 daemon=True).start()
         return "好的，我看看水杯。"
 
+    # ---- 跟踪帧（2026-10-14 舵机云台）：只算角度回传，不落盘、不进在座状态机 ----
+    if photo_type == "track":
+        if not TRACK.get("enabled"):
+            return jsonify({"ok": False, "reason": "tracking_off"}), 200
+        _t0 = time.time()
+        angle, tilt = tracking_compute_angle(image_bytes)
+        # 2026-10-16 平滑化调优：打印每帧耗时与图大小，定位瓶颈（稳定后删）
+        log(f"track帧: {len(image_bytes)//1024}KB 桥接处理{(time.time()-_t0)*1000:.0f}ms "
+            f"-> pan={angle} tilt={tilt}")
+        return jsonify({"ok": True, "servo": angle, "tilt": tilt}), 200
+
     # ---- 扩展拍摄位照（2026-09-17 多拍摄位）：ex1/ex2/ex3，只存档不做判定 ----
     if photo_type.startswith("ex") and photo_type[2:].isdigit():
         idx = int(photo_type[2:]) - 1
@@ -1596,6 +2926,25 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     with _state_lock:
         STATE["last_vision_ts"] = now.isoformat(timespec="seconds")
         STATE["last_presence"] = presence
+        # 2026-10-27 修复「离开时长算少」：视觉确认离座（无脸+无动作）就
+        # 记为离座起点，不再等设备哨兵的"离座"事件。此前 16:14 人已走、
+        # 视觉连续判 absent，但哨兵 16:38 才报离座 → 回归只播"约 4 分钟"
+        # （真实 28 分钟）。起点只在本轮首次确立，重复事件不覆盖。
+        if (presence == "absent"
+                and isinstance(detail, dict)
+                and detail.get("reason") == "no_face_no_motion_confirmed"
+                and not STATE.get("in_seat_since")
+                and not STATE.get("away_since")):
+            STATE["away_since"] = now.isoformat(timespec="seconds")
+            log("视觉确认离座，开始记录离座起点"
+                f"（{STATE['away_since']}）")
+        STATE["last_vision_faces_large"] = (
+            detail.get("faces_large", 0) if isinstance(detail, dict) else 0)
+        # 人脸识别（2026-10-10）：对账/验明正身改认"主人脸"
+        STATE["last_vision_user_faces"] = (
+            detail.get("user_faces", 0) if isinstance(detail, dict) else 0)
+        STATE["last_vision_user_sim"] = (
+            detail.get("user_sim") if isinstance(detail, dict) else None)
         STATE["last_photo_meta"] = {
             "device": device_id,
             "bytes": len(image_bytes),
@@ -1612,6 +2961,27 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
             if not STATE.get("in_seat_since"):
                 STATE["in_seat_since"] = now_iso
                 log("检测到有人入座，开始计时")
+                # 视觉兜底回归播报（2026-10-10）：幻影回归被拦截后，设备侧
+                # 哨兵状态已切成"在座"，用户真回来时设备不再发"回归"事件，
+                # 正常的哨兵播报路径就不会触发（当日 13:28 实测漏播）。
+                # 这里由视觉轮询兜底：此前有确认过的真离座（away_since 在），
+                # 现在照片见到主人脸入座 → 补一条回归播报，按 away_since
+                # 补算时长。两个防打架守卫：
+                #   - pending_return 在 → 交给 _check_pending_return 验明
+                #     正身路径播报（它有更准的事件时间，避免双播）；
+                #   - pending_away 在 → 离座还在复核中，见脸属于"误报离座"，
+                #     由复核路径静默恢复计时，不能播"回来了"。
+                away_since = _parse_ts(STATE.get("away_since") or "")
+                if (away_since and not STATE.get("pending_return")
+                        and not STATE.get("pending_away")):
+                    minutes = max(
+                        1, int((now - away_since).total_seconds() / 60))
+                    msg = f"主人回到座位啦，刚才离开了大约 {minutes} 分钟。"
+                    STATE["away_since"] = None
+                    STATE["last_remind_ts"] = None
+                    push_speak(STATE, msg, source="sentinel")
+                    log(f"视觉兜底回归播报：确认离座 {minutes} 分钟后"
+                        f"照片见主人脸入座（{msg}）")
                 # 打卡式记录（P2-⑭）：今天第一次确认在座 → 推飞书
                 # 打卡时间无条件记录（进状态与下班汇总），飞书推送才受开关控制
                 if (cfg("punch_in", "enabled", default=True)
@@ -1624,15 +2994,31 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                             daemon=True).start()
             STATE["last_in_seat_ts"] = now_iso
 
-            # 访客提醒（P2-⑬）：一帧里出现多张脸 → 飞书 + 机器人说一声
-            faces = detail.get("faces", 0) if isinstance(detail, dict) else 0
-            min_faces = int(cfg("visitor", "min_faces", default=2))
+            # 访客提醒（P2-⑬，2026-10-10 人脸识别版）：座位区域里出现
+            # "不是主人"的大脸 → 飞书记录。识别未启用时退回旧逻辑
+            # （第二张大脸）。远处邻座的小脸不算。
+            strangers = (detail.get("stranger_faces") if isinstance(detail, dict)
+                         else None)
+            recog_on = (detail.get("user_sim") is not None
+                        or (isinstance(detail, dict)
+                            and detail.get("user_faces", 0) > 0))
+            if recog_on and strangers is not None:
+                faces = strangers
+                min_faces = 1
+            else:
+                faces = (detail.get("faces_large") if isinstance(detail, dict)
+                         else None)
+                if faces is None:
+                    faces = (detail.get("faces", 0)
+                             if isinstance(detail, dict) else 0)
+                min_faces = int(cfg("visitor", "min_faces", default=2))
             if cfg("visitor", "enabled", default=True) and faces >= min_faces:
                 v_last = _parse_ts(STATE.get("visitor_last_ts"))
                 cooldown = float(cfg("visitor", "cooldown_minutes", default=10))
                 if v_last is None or (now - v_last).total_seconds() >= cooldown * 60:
                     STATE["visitor_last_ts"] = now_iso
-                    log(f"访客提醒：画面中出现 {faces} 张脸")
+                    log(f"访客提醒：画面中出现 {faces} 张非主人脸"
+                        if recog_on else f"访客提醒：画面中出现 {faces} 张脸")
                     if cfg("notify", "feishu", default=True):
                         threading.Thread(
                             target=notify_feishu,
@@ -1713,6 +3099,31 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
                 STATE["last_remind_ts"] = None
         # unknown 不改变计时状态
 
+        # 离座访客提醒（2026-10-10 人脸识别解锁）：主人不在工位时，
+        # 座位区域出现"非主人"的大脸 → 飞书推送（识别开启才有 stranger_faces）
+        if (cfg("visitor", "enabled", default=True)
+                and cfg("visitor", "alert_when_away", default=True)
+                and STATE.get("in_seat_since") is None
+                and isinstance(detail, dict)
+                and int(detail.get("stranger_faces") or 0) >= 1):
+            av_last = _parse_ts(STATE.get("away_visitor_last_ts"))
+            av_cd = float(cfg("visitor", "cooldown_minutes", default=10))
+            if av_last is None or (now - av_last).total_seconds() >= av_cd * 60:
+                STATE["away_visitor_last_ts"] = now.isoformat(timespec="seconds")
+                log("离座访客：主人不在时座位区域出现陌生人")
+                if cfg("notify", "feishu", default=True):
+                    threading.Thread(
+                        target=notify_feishu,
+                        args=(f"👀 离座访客：{now.strftime('%H:%M')} 你不在工位时，"
+                              "座位区域出现了别人（可能是来找你的或路过）。",),
+                        daemon=True).start()
+                # 2026-10-15 用户：离座时来人才需要提醒（在座自己看得到）。
+                # 飞书可能没开，语音播报是主通知路径。
+                if cfg("visitor", "speak_when_away", default=True):
+                    push_speak(STATE,
+                               "主人，你不在工位的时候，有人来到你的座位附近了。",
+                               source="visitor_away")
+
         since = _parse_ts(STATE.get("in_seat_since"))
         minutes_in_seat = (now - since).total_seconds() / 60 if since else None
 
@@ -1739,6 +3150,29 @@ def handle_seat_check(image_bytes, question, device_id, photo_name, photo_ts):
     # 水位判定）已删除——2026-09-16 双拍摄位分流后不再需要。
     log(f"vision: presence={presence} detail={detail} "
         f"in_seat_min={None if minutes_in_seat is None else round(minutes_in_seat)}")
+
+    # 跟踪自动重启（2026-10-16 用户方案）：跟踪开着但处于待机（丢脸超时
+    # 已停）时，在座判定看到主人在座 → 自动重启跟踪。
+    # 2026-10-21 配套熔断器：熔断回正后同样走这里恢复；60s 冷却给瞬态
+    # 原因（人站在视野边缘等）消散的时间，防"重启即熔断"连击。
+    if TRACK.get("enabled") and not TRACK.get("active") and presence == "in_seat":
+        sc = _safety_cfg()
+        since_trip = time.time() - (TRACK.get("last_trip_ts") or 0.0)
+        if TRACK.get("last_trip_ts") and since_trip < sc["restart_cooldown_s"]:
+            log("舵机熔断后冷却中（还剩 %.0fs），暂缓自动重启跟踪"
+                % (sc["restart_cooldown_s"] - since_trip), "WARN")
+        else:
+            tc = _track_cfg()
+            TRACK["active"] = True
+            TRACK["angle"] = tc["home_pan"]
+            TRACK["tilt"] = tc["home_tilt"]
+            TRACK["last_face_ts"] = 0.0
+            TRACK["last_frame_ts"] = time.time()
+            _push_pending_command("tracking", "on")
+            log("人脸跟踪：在座判定看到主人回来，自动重启跟踪")
+
+    # 哨兵"回归"验明正身：暂扣中的回归事件用本张判定照片复核
+    _check_pending_return(presence, detail)
 
 
 def _save_photo(image_bytes, device_id):
@@ -1938,6 +3372,30 @@ def task():
 #  AudioService::PlaySound 本地喇叭直接播。同文本+音色做磁盘缓存。
 # ==========================================================================
 
+# ---- TTS 失败留痕告警（2026-10-21）----
+# 教训：2026-10-12 起 edge-tts 403 静默失败 5 天（17 次播报无声）无人知晓。
+# 失败必须计数并告警；30 分钟最多提醒一次防刷屏。
+_tts_fail_stat = {"count": 0, "last_ts": 0.0, "last_alert_ts": 0.0}
+_TTS_FAIL_ALERT_COOLDOWN_S = 1800.0
+
+
+def _tts_fail_alert(err):
+    _tts_fail_stat["count"] += 1
+    _tts_fail_stat["last_ts"] = time.time()
+    now = time.time()
+    if now - _tts_fail_stat["last_alert_ts"] < _TTS_FAIL_ALERT_COOLDOWN_S:
+        return
+    _tts_fail_stat["last_alert_ts"] = now
+    log("TTS 连续失败（累计 %d 次）：%s" % (_tts_fail_stat["count"], err),
+        "ERROR")
+    if cfg("notify", "feishu", default=True):
+        threading.Thread(target=notify_feishu, args=(
+            "🔊 小栗 TTS 告警\n语音合成失败（累计 %d 次），最新错误：%s\n"
+            "播报会退化为提示音，请检查网络或 edge-tts 版本（需 >=7.3.1）。"
+            % (_tts_fail_stat["count"], str(err)[:200]),),
+            daemon=True).start()
+
+
 def _tts_synthesize(text, voice, out_path):
     """edge-tts 合成 mp3 → PyAV 转 ogg opus 24kHz mono。成功返回 True。"""
     import tempfile
@@ -1948,6 +3406,7 @@ def _tts_synthesize(text, voice, out_path):
         import av as pyav
     except ImportError as e:
         log(f"TTS 依赖缺失（pip install edge-tts av）：{e}", "WARN")
+        _tts_fail_alert(e)
         return False
 
     mp3_path = _Path(tempfile.gettempdir()) / f"stackchan_tts_{os.getpid()}.mp3"
@@ -1959,6 +3418,7 @@ def _tts_synthesize(text, voice, out_path):
         asyncio.run(_synth())
         if not mp3_path.exists() or mp3_path.stat().st_size < 512:
             log("TTS 合成结果为空", "WARN")
+            _tts_fail_alert("合成结果为空")
             return False
 
         inp = pyav.open(str(mp3_path))
@@ -1977,6 +3437,7 @@ def _tts_synthesize(text, voice, out_path):
         return True
     except Exception as e:  # noqa: BLE001
         log(f"TTS 合成失败：{e}", "WARN")
+        _tts_fail_alert(e)
         return False
     finally:
         try:
@@ -2083,6 +3544,213 @@ def tts_audio(key):
     return resp
 
 
+def _vision_recently_sees_user(max_age_s=390):
+    """最近一次视觉判定是否为"在座且认出主人脸"，且证据未过时。
+
+    拍照节奏约 5 分钟一张，390 秒（6.5 分钟）内算新鲜。人脸识别开启时
+    user_faces>=1 才算真看到"主人"——纯 motion 兜底在座不可靠，陌生人脸
+    更不能顶替主人。
+    """
+    with _state_lock:
+        ts = STATE.get("last_vision_ts")
+        pres = STATE.get("last_presence")
+        user_faces = STATE.get("last_vision_user_faces")
+        large = STATE.get("last_vision_faces_large", 0)
+    if not ts or pres != "in_seat":
+        return False
+    t = _parse_ts(ts)
+    if t is None or (datetime.now() - t).total_seconds() > max_age_s:
+        return False
+    if user_faces is not None:
+        try:
+            return int(user_faces or 0) >= 1
+        except (TypeError, ValueError):
+            return False
+    # 识别未启用时退回旧判据：大脸才算
+    try:
+        return int(large or 0) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _request_verify_photo():
+    """给设备派一张"立即拍照复核"单（固件 photo 指令，2026-10-10）。
+
+    哨兵离开/回归事件后不再干等下一个 5 分钟周期照：塞一张拍照单进
+    pending 队列，设备 10 秒内领单立即拍照上传，验证延迟缩到 ~20 秒。
+    队列里已有拍照单时不重复派。
+    """
+    with _state_lock:
+        for it in STATE.get("pending", []):
+            if isinstance(it, dict) and it.get("type") == "photo":
+                return
+        STATE["pending"].append({
+            "type": "photo",
+            "message": "verify",
+            "source": "sentinel",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        save_state(STATE)
+    log("已派单：设备立即拍照复核哨兵事件（~10s 内领单）")
+
+
+def _check_pending_return(presence, detail):
+    """哨兵"离开/回归"事件的验明正身（2026-10-10 派单拍照版）。
+
+    哨兵事件到达时桥接先派单让设备立即拍照（_request_verify_photo），
+    本函数在每张判定照片到达后复核暂扣中的事件：
+      - 回归 + 见大脸 → 真回归：按 away_since 补算真实时长播报，计时重起；
+      - 回归 + 无人脸 → 继续暂扣，720s 超时判幻影拦截；
+      - 离座 + 见大脸 → 误报离座：恢复久坐计时（在座秒数未入账）；
+      - 离座 + 无人脸 → 真离座：入账在座秒数。
+    """
+    with _state_lock:
+        pr = STATE.get("pending_return")
+        pa = STATE.get("pending_away")
+        if not pr and not pa:
+            return
+        now = datetime.now()
+        # 验明正身改认"主人脸"（2026-10-10 人脸识别）：识别开启时
+        # user_faces>=1 才是真主人；未启用退回 faces_large
+        user_faces = detail.get("user_faces") if isinstance(detail, dict) else None
+        large = detail.get("faces_large", 0) if isinstance(detail, dict) else 0
+        if user_faces is not None:
+            seen = (presence == "in_seat" and int(user_faces or 0) >= 1)
+        else:
+            seen = (presence == "in_seat" and int(large or 0) >= 1)
+
+        if pr:
+            if seen:
+                away_since = _parse_ts(STATE.get("away_since") or "")
+                if away_since:
+                    minutes = max(1, int((now - away_since).total_seconds() / 60))
+                    msg = f"主人回到座位啦，刚才离开了大约 {minutes} 分钟。"
+                else:
+                    msg = pr.get("message") or "主人回到座位啦。"
+                STATE["pending_return"] = None
+                STATE["pending_away"] = None
+                STATE["away_since"] = None
+                STATE["in_seat_since"] = now.isoformat(timespec="seconds")
+                STATE["last_remind_ts"] = None
+                push_speak(STATE, msg, source="sentinel")
+                save_state(STATE)
+                log(f"哨兵回归验明正身：照片见到人脸 → 播报回归（{msg}）")
+            else:
+                ts = _parse_ts(pr.get("ts") or "")
+                if ts and (now - ts).total_seconds() > 720:
+                    STATE["pending_return"] = None
+                    save_state(STATE)
+                    log("哨兵回归判幻影：复核期内照片始终未见人脸，拦截播报")
+                else:
+                    log("哨兵回归暂扣中：本张照片未见人脸，继续等待")
+            return
+
+        # 离座复核
+        away_ts = _parse_ts(pa.get("ts") or "") or now
+        if seen:
+            # 误报离座：人还在——在座秒数尚未入账，恢复计时即可
+            STATE["pending_away"] = None
+            STATE["away_since"] = None
+            STATE["in_seat_since"] = away_ts.isoformat(timespec="seconds")
+            save_state(STATE)
+            log("哨兵离座验照：照片见人脸 → 判误报，久坐计时恢复（视为未离座）")
+        else:
+            seg = int(pa.get("seg") or 0)
+            STATE["in_seat_seconds_today"] = (
+                STATE.get("in_seat_seconds_today", 0) + seg)
+            STATE["pending_away"] = None
+            save_state(STATE)
+            log("哨兵离座验照：照片无人脸 → 确认真离座，计时入账")
+
+
+def _sweep_verify_timeouts():
+    """设备离线等导致复核照迟迟不来时的惰性超时结算（/pending 轮询触发）。"""
+    with _state_lock:
+        now = datetime.now()
+        changed = False
+        pr = STATE.get("pending_return")
+        if pr:
+            ts = _parse_ts(pr.get("ts") or "")
+            if ts and (now - ts).total_seconds() > 720:
+                STATE["pending_return"] = None
+                changed = True
+                log("哨兵回归超时未获复核照，判幻影拦截")
+        pa = STATE.get("pending_away")
+        if pa:
+            ts = _parse_ts(pa.get("ts") or "")
+            if ts and (now - ts).total_seconds() > 720:
+                STATE["in_seat_seconds_today"] = (
+                    STATE.get("in_seat_seconds_today", 0)
+                    + int(pa.get("seg") or 0))
+                STATE["pending_away"] = None
+                changed = True
+                log("哨兵离座超时未获复核照，按真离座结算计时")
+        if changed:
+            save_state(STATE)
+
+
+def _reconcile_sentinel_event(message):
+    """固件离座哨兵事件 vs 桥接视觉对账（2026-10-09，10-10 升级派单拍照）。
+
+    固件哨兵只看动作差（15 秒一帧），后仰/低头易把"人还在"误判成"离座"，
+    离座期间判定区里远处同事的动静还会编出"回归"幻影（2026-10-09 实测）。
+    哨兵事件先送这里复核：
+      - 与视觉近期人脸证据矛盾 → 拦截（veto）；
+      - 无近期人脸证据可判 → 暂扣（hold）并派单让设备立即拍照，
+        由 _check_pending_return 用复核照定案（见该函数注释）。
+      - "回到座位"：视觉近期一直见人脸 → 用户根本没走过，拦截播报；
+      - "离开了座位"：视觉近期见人脸 → 疑似误判，拦截提醒；
+      - 视觉证据过时或与事件一致 → 放行，并对账久坐计时
+        （放行离座 → 计时暂停；放行回归 → 计时重新起算）。
+    副作用：短离座（<约 6 分钟）天然被静默成"计数不打扰"，与喝水策略一致。
+    返回 "veto"（拦截）或 "accept"（放行）。
+    """
+    vision_sees_user = _vision_recently_sees_user()
+    if "回到座位" in message:
+        if vision_sees_user:
+            log("哨兵对账：报'回到座位'但视觉近期持续见人脸 → 判误报，已拦截播报")
+            return "veto"
+        # 幻影回归防御（2026-10-09 晚）：用户实测离座期间哨兵仍连报
+        # "回归→离座→回归"（判定区里远处同事的动静骗过了纯动作差检测）。
+        # 眼里没有近期人脸证据时不再直接放行播报，而是暂扣，等下一张
+        # 判定照片验明正身（见 _check_pending_return）。
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with _state_lock:
+            old = STATE.get("pending_return")
+            if old:
+                log("哨兵对账：又一条'回归'，覆盖暂扣中的上一条")
+            STATE["pending_return"] = {"ts": now_iso, "message": message}
+            save_state(STATE)
+        log("哨兵对账：报'回归'但无近期人脸证据 → 暂扣播报，立即拍照复核")
+        _request_verify_photo()
+        return "hold"
+    if "离开了座位" in message:
+        if vision_sees_user:
+            log("哨兵对账：报'离座'但视觉近期见人脸 → 判误报，已拦截提醒")
+            return "veto"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with _state_lock:
+            since = _parse_ts(STATE.get("in_seat_since") or "")
+            # 在座秒数先不入账：等复核照确认是真离座再结算（见
+            # _check_pending_return），误报离座时计时无缝恢复
+            seg = int((datetime.now() - since).total_seconds()) if since else 0
+            STATE["in_seat_since"] = None
+            # 新的离座事件说明暂扣中的"回归"是幻影（人没回来过就谈不上再离开）
+            if STATE.get("pending_return"):
+                STATE["pending_return"] = None
+                log("哨兵对账：离座事件到达，暂扣中的'回归'判幻影丢弃")
+            # 2026-10-27：重复的离座事件不得覆盖已有离座起点——否则「16:14
+            # 已走、16:38 哨兵又报一次离座」会把时长算成 4 分钟
+            if not STATE.get("away_since"):
+                STATE["away_since"] = now_iso
+            STATE["pending_away"] = {"ts": now_iso, "seg": seg}
+            save_state(STATE)
+        log("哨兵对账：报'离座'且无近期人脸证据 → 暂缓结算，立即拍照复核")
+        _request_verify_photo()
+        return "hold"
+    return "accept"
+
+
 @app.route("/notify", methods=["POST"])
 def notify():
     """反向通道入口（P2-⑨）：外部（Hermes 技能、日历轮询、其他程序）推一句
@@ -2117,6 +3785,17 @@ def notify():
         return jsonify({"ok": True, "message": "重复消息已忽略（90 秒内去重）",
                         "deduped": True})
 
+    # 哨兵事件对账（2026-10-09）：固件离座哨兵的"离开/回来"先送视觉复核，
+    # 与最近人脸判定矛盾时拦截，避免"刚提醒起身又说你回来了"这类打架
+    if source == "sentinel":
+        verdict = _reconcile_sentinel_event(message)
+        if verdict == "veto":
+            return jsonify({"ok": True, "vetoed": True,
+                            "message": "视觉判定与哨兵事件矛盾，已拦截播报"})
+        if verdict == "hold":
+            return jsonify({"ok": True, "held": True,
+                            "message": "哨兵事件暂扣，已派单拍照复核"})
+
     with _state_lock:
         reset_daily_if_needed(STATE)
         if kind == "alert":
@@ -2143,6 +3822,7 @@ def pending():
     if not check_token():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _DEVICE_LAST_SEEN["ts"] = time.time()   # Dashboard：设备在线心跳
+    _sweep_verify_timeouts()                # 复核事件惰性超时结算
     with _state_lock:
         items = list(STATE.get("pending", []))
     return jsonify({"ok": True, "items": items})
@@ -2655,8 +4335,53 @@ def main():
         log("提示：hermes.feishu_target 为空，飞书推送会被跳过。"
             "用 `hermes send --list` 查看可用目标。", "WARN")
 
+    # 跟踪开关状态恢复（2026-10-17）：此前 enabled 是内存态，桥接/电脑重启
+    # 就丢（今早电脑开机后"在座判定看到人也不重启"即此因）。从 state.json
+    # 恢复并立即补发开启指令（设备已在跟则 no-op）。
+    # 2026-10-21：先跑舵机安全自检，限位配置不合法（包不住归位姿态）时拒绝
+    # 自动恢复，防止一开机就把舵机往限位顶。
+    _safety_ok = _safety_startup_check()
+    if STATE.get("tracking_enabled") and not _safety_ok:
+        with _state_lock:
+            STATE["tracking_enabled"] = False
+            save_state(STATE)
+        log("跟踪自动恢复已拦截：请先修正 tracking 限位配置", "ERROR")
+    if STATE.get("tracking_enabled"):
+        tc = _track_cfg()
+        TRACK["enabled"] = True
+        TRACK["active"] = True
+        TRACK["angle"] = tc["home_pan"]
+        TRACK["tilt"] = tc["home_tilt"]
+        TRACK["last_frame_ts"] = time.time()
+        with _state_lock:
+            has = any(p.get("type") == "tracking" and p.get("message") == "on"
+                      for p in STATE.get("pending", []))
+        if not has:
+            _push_pending_command("tracking", "on")
+        log("人脸跟踪：检测到上次为开启状态，已恢复（补发开启指令）")
+
+    threading.Thread(target=_tracking_keepalive, daemon=True,
+                     name="track-keepalive").start()
+    threading.Thread(target=_track_stream_server, daemon=True,
+                     name="track-stream-accept").start()
     app.run(host=host, port=port, threaded=True, debug=False)
 
 
 if __name__ == "__main__":
+    # 崩溃留痕：pythonw 下 stderr 为 None，任何未捕获异常/原生崩溃都无声消失。
+    # faulthandler 把段错误等原生崩溃的调用栈写进 bridge_crash.log，便于追溯。
+    try:
+        import faulthandler
+        _crash = open(os.path.join(DATA_DIR, "bridge_crash.log"),
+                      "a", encoding="utf-8", errors="replace")
+        _crash.write("\n[%s] ---- bridge start (pid=%d) ----\n"
+                     % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()))
+        _crash.flush()
+        if sys.stderr is None:
+            sys.stderr = _crash
+        if sys.stdout is None:
+            sys.stdout = _crash
+        faulthandler.enable(file=_crash)
+    except Exception:
+        pass
     main()

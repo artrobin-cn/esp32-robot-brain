@@ -235,3 +235,31 @@ daily_summary:
 focus:
   enabled: false
   cooldown_minutes: 45
+
+# ---------------- 人脸跟踪（二维云台）与舵机安全 ----------------
+# 摄像头装在 SG90 二维云台上，5fps 闭环跟主人脸。以下为舵机安全保护
+# 与跟踪行为参数（2026-10-22 配套俯仰舵机堵转烧毁事故的经验）：
+tracking:
+  gain: 14                  # 水平比例增益
+  max_step: 6               # 每帧最大步进（度）
+  deadband: 0.04            # 死区
+  min_angle: 40             # 水平软限位（必须包住 home_pan，启动自检会验）
+  max_angle: 140
+  tilt_gain: 14
+  tilt_flip: true
+  tilt_min_angle: 60        # 俯仰软限位（必须包住 home_tilt）
+  tilt_max_angle: 140       # 120 会钉死（跟踪常用 130-135），160 未验证行程
+  stall_limit_s: 10         # 堵转熔断：目标角连续钉死限位超过该秒数 →
+                            # 停跟踪+回正+播报；10 分钟内 3 次锁死需手动重启
+  trip_lockout: 3
+  restart_cooldown_s: 60    # 熔断回正后自动重启冷却（归位角对着座位，
+                            # 在座判定看到主人回来自动恢复）
+  servo_clamp: true         # 手动 /servo 指令夹到软限位内（标定时临时关）
+  safety_speak: true        # 熔断时语音播报
+  follow_owner_only: true   # 跟踪只认主人脸（SFace 验身份），防追别人
+  recog_acquire_threshold: 0.45  # 重新锁定目标的迟滞门槛（防访客误匹配
+                            # 抢目标来回跳；继续跟旧目标只需 0.363）
+  standby_delay_s: 30       # 丢脸超时转待机
+  home_pan: 100             # 归位角（对准座位，供在座判定自动重启）
+  home_tilt: 110
+  stream_port: 8789         # 跟踪视频流 TCP 端口

@@ -106,6 +106,16 @@
   .badge.neutral{background:#f1f1ef;color:var(--ink2);}
   .badge.accent{background:var(--accent-bg);color:var(--accent);}
   .badge.plain{background:#fff;border:1px solid var(--border);color:var(--ink2);}
+  /* 滑杆（人脸跟踪回位角度，2026-10-23） */
+  .range{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:3px;
+         background:var(--border2);outline:none;cursor:pointer;}
+  .range::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;
+         border-radius:50%;background:var(--accent);border:2px solid #fff;
+         box-shadow:0 1px 3px rgba(15,15,15,.25);cursor:pointer;}
+  .range::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--accent);
+         border:2px solid #fff;box-shadow:0 1px 3px rgba(15,15,15,.25);cursor:pointer;}
+  .trk-thumb{width:58px;height:44px;object-fit:cover;border-radius:6px;
+             border:1px solid var(--border);display:none;}
 
   /* 列表行 */
   .li{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #f1f1ef;font-size:13px;}
@@ -222,6 +232,10 @@
       <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2.5" y="5" width="11" height="7" rx="1.5"/><path d="M6 5V3.8A1.3 1.3 0 0 1 7.3 2.5h1.4A1.3 1.3 0 0 1 10 3.8V5"/><circle cx="8" cy="8.5" r="2"/></svg>
       拍摄位标定
     </button>
+    <button class="nav-item" data-tab="tracking">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="7" r="2.6"/><path d="M3 13.5c.8-2.4 2.8-3.7 5-3.7s4.2 1.3 5 3.7" stroke-linecap="round"/><path d="M13.5 3.2v2M13.5 3.2h-2M2.5 3.2v2M2.5 3.2h2" stroke-linecap="round"/></svg>
+      人脸跟踪
+    </button>
 
     <!-- 设备状态常驻 -->
     <div class="side-dev" id="side-dev">
@@ -244,6 +258,7 @@
       <button data-tab="logs">日志</button>
       <button data-tab="settings">设置</button>
       <button data-tab="poses">拍摄位</button>
+      <button data-tab="tracking">跟踪</button>
     </div>
 
     <!-- ========== 总览 ========== -->
@@ -504,6 +519,81 @@
         </div>
       </div>
     </div>
+    <!-- ========== 人脸跟踪 ========== -->
+    <div class="view" id="view-tracking">
+      <div class="pagehead">
+        <div><h1>人脸跟踪</h1><div class="desc">只跟注册过的主人脸 · 目标角钉死限位 10 秒自动熔断回正 · 保存后立即生效（免重启）</div></div>
+      </div>
+
+      <div class="grid g2">
+        <div class="card">
+          <div class="card-h"><span class="t">跟踪设定（免重启）</span></div>
+          <div class="card-b" style="padding-top:6px;padding-bottom:8px">
+            <div class="field">
+              <div>
+                <div class="fl">跟踪对象（推断依据）</div>
+                <div class="fd">SFace 认这张脸才跟；单人正脸照，多角度/多光线追加更稳，脸宽 &lt;60px 会被拒</div>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+                <img id="trk-ref" class="trk-thumb" alt="参考照">
+                <span class="badge neutral" id="trk-tpl">— 张</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;padding:0 0 6px 2px">
+              <input type="file" id="trk-file" accept="image/*" style="display:none" onchange="trkUpload()">
+              <button class="btn" onclick="trkPick(false)">上传照片追加</button>
+              <button class="btn" onclick="trkPick(true)">清空重注册</button>
+            </div>
+            <div class="field">
+              <div>
+                <div class="fl">回位角度 · 水平</div>
+                <div class="fd">丢人 30 秒后回到这个角度（对准座位）；跟踪关闭时拖动可预览转头</div>
+              </div>
+              <div style="display:flex;gap:10px;align-items:center;flex-shrink:0;width:230px">
+                <input type="range" id="trk-pan" class="range" min="42" max="138" step="1" oninput="trkSlide()">
+                <span class="mono" id="trk-pan-v" style="width:38px;text-align:right">—</span>
+              </div>
+            </div>
+            <div class="field">
+              <div>
+                <div class="fl">回位角度 · 俯仰</div>
+                <div class="fd">角度越大越抬头；110 左右是正对座位的高度</div>
+              </div>
+              <div style="display:flex;gap:10px;align-items:center;flex-shrink:0;width:230px">
+                <input type="range" id="trk-tilt" class="range" min="62" max="138" step="1" oninput="trkSlide()">
+                <span class="mono" id="trk-tilt-v" style="width:38px;text-align:right">—</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;padding:10px 0 2px;">
+              <button class="btn primary" onclick="trkSave()">保存设定</button>
+              <button class="btn" onclick="trkReset()">恢复默认值</button>
+            </div>
+            <div class="status-line" id="trk-status"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h"><span class="t">当前生效状态</span></div>
+          <div class="card-b" style="padding-top:8px;padding-bottom:10px">
+            <table><tbody>
+              <tr><td style="color:var(--ink2);width:40%">跟踪开关</td>
+                  <td style="display:flex;align-items:center;gap:10px">
+                    <span class="badge neutral" id="trk-badge">—</span>
+                    <button class="btn" id="trk-toggle" onclick="trkToggle()">—</button>
+                  </td></tr>
+              <tr><td style="color:var(--ink2)">当前角度</td><td class="mono" id="trk-ang">—</td></tr>
+              <tr><td style="color:var(--ink2)">主人相似度</td><td class="mono" id="trk-sim">—</td></tr>
+              <tr><td style="color:var(--ink2)">熔断状态</td><td class="mono" id="trk-breaker">—</td></tr>
+              <tr><td style="color:var(--ink2)">模板张数</td><td class="mono" id="trk-tpl2">—</td></tr>
+            </tbody></table>
+            <div style="font-size:11.5px;color:var(--ink3);padding:10px 2px 2px;line-height:1.7">
+              只跟注册主人脸，锁定+迟滞门槛防访客抢目标；目标角钉死限位 10 秒自动回正暂停，
+              人坐回座位后自动恢复；10 分钟内连熔 3 次锁死，需在此手动打开。
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 
@@ -565,6 +655,7 @@ function refreshTab(tab){
   else if(tab==="photos") refreshPhotos();
   else if(tab==="analysis"){ refreshAnalysis(); }
   else if(tab==="logs") refreshLogs();
+  else if(tab==="tracking"){ trkRefLoaded = false; loadTracking(); }
 }
 
 /* ---- 总览 ---- */
@@ -1149,6 +1240,130 @@ setInterval(refreshSummary, 180000);
 setInterval(refreshPhotos, 180000);
 setInterval(refreshAnalysis, 180000);
 setInterval(loadStability, 180000);
+setInterval(() => { if (curTab === "tracking") loadTracking(); }, 5000);
+
+/* ---- 人脸跟踪（2026-10-23） ---- */
+let trkReplace = false, trkDragTimer = null, trkRefLoaded = false;
+function trkValues(){
+  return {home_pan: +$("trk-pan").value, home_tilt: +$("trk-tilt").value};
+}
+function trkShowValues(){
+  $("trk-pan-v").textContent = $("trk-pan").value + "°";
+  $("trk-tilt-v").textContent = $("trk-tilt").value + "°";
+}
+function trkSlide(){
+  trkShowValues();
+  clearTimeout(trkDragTimer);
+  trkDragTimer = setTimeout(trkPreview, 300);
+}
+async function trkPreview(){
+  try{
+    const d = await (await fetch("/api/dashboard/tracking", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(Object.assign(trkValues(), {preview:true}))})).json();
+    const st = $("trk-status");
+    if(d && d.tracking_active){
+      st.textContent = "跟踪中：拖动只改数值，头不会转（跟着你才是它的本职）；关掉跟踪后可预览转头";
+      st.className = "status-line";
+    }
+  }catch(e){}
+}
+async function loadTracking(){
+  try{
+    const d = await (await fetch("/api/dashboard/tracking")).json();
+    if(!d.ok) return;
+    const panEl = $("trk-pan"), tiltEl = $("trk-tilt");
+    panEl.min = d.limits.pan[0] + 2;  panEl.max = d.limits.pan[1] - 2;
+    tiltEl.min = d.limits.tilt[0] + 2; tiltEl.max = d.limits.tilt[1] - 2;
+    const act = document.activeElement;
+    if(act !== panEl && act !== tiltEl){     // 拖动/聚焦时不覆盖用户值
+      panEl.value = d.home_pan; tiltEl.value = d.home_tilt;
+      trkShowValues();
+    }
+    $("trk-tpl").textContent = d.templates + " 张";
+    $("trk-tpl2").textContent = d.templates + " 张";
+    $("trk-ang").textContent = "pan " + d.angle + "° · tilt " + d.tilt + "°";
+    $("trk-sim").textContent = d.owner_sim == null
+      ? "—（没认出主人）" : Number(d.owner_sim).toFixed(3);
+    const b = d.breaker;
+    $("trk-breaker").textContent = !b ? "正常"
+      : (b.lockout ? "已锁死 · " + b.reason + " · " + b.ts
+                   : "第 " + b.count + " 次 · " + b.reason + " · " + b.ts);
+    const badge = $("trk-badge"), btn = $("trk-toggle");
+    if(d.enabled && d.active){ badge.textContent = "正在跟踪"; badge.className = "badge ok"; btn.textContent = "关闭跟踪"; }
+    else if(d.enabled){ badge.textContent = "待机"; badge.className = "badge warn"; btn.textContent = "关闭跟踪"; }
+    else { badge.textContent = "已关闭"; badge.className = "badge neutral"; btn.textContent = "开启跟踪"; }
+    if(!trkRefLoaded) loadRef();
+  }catch(e){}
+}
+function loadRef(url){
+  const img = $("trk-ref");
+  img.onload = function(){ img.style.display = "block"; trkRefLoaded = true; };
+  img.onerror = function(){ img.style.display = "none"; };
+  img.src = url || ("/api/dashboard/tracking/ref.jpg?t=" + Date.now());
+}
+async function trkReset(){
+  const st = $("trk-status");
+  try{
+    const d = await (await fetch("/api/dashboard/tracking", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({reset:true})})).json();
+    if(!d.ok) throw new Error(d.error || "恢复失败");
+    st.textContent = "✓ 已恢复 config.yaml 默认：" + d.home_pan + "° / " + d.home_tilt + "°";
+    st.className = "status-line ok";
+    loadTracking();
+  }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
+}
+async function trkSave(){
+  const st = $("trk-status");
+  try{
+    const d = await (await fetch("/api/dashboard/tracking", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(trkValues())})).json();
+    if(!d.ok) throw new Error(d.error || "保存失败");
+    st.textContent = d.tracking_active
+      ? "✓ 已保存：丢人 30 秒后会回到这个角度（跟踪中头不预转，跟着你才是本职）"
+      : "✓ 已保存，丢人 30 秒后会回到这个角度" + (d.servo_preview ? "（头已跟过去预览）" : "");
+    st.className = "status-line ok";
+    loadTracking();
+  }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
+}
+function trkPick(replace){
+  trkReplace = replace;
+  const f = $("trk-file");
+  f.value = "";
+  f.click();
+}
+async function trkUpload(){
+  const inp = $("trk-file"), st = $("trk-status");
+  if(!inp.files.length) return;
+  const fd = new FormData();
+  fd.append("file", inp.files[0]);
+  try{
+    const d = await (await fetch("/api/dashboard/tracking/enroll"
+        + (trkReplace ? "?replace=1" : ""), {method:"POST", body:fd})).json();
+    if(!d.ok) throw new Error(d.error || "注册失败");
+    st.textContent = "✓ 已注册" + (d.replaced ? "（旧模板已清空）" : "")
+      + "，当前模板 " + d.templates + " 张"
+      + (d.self_sim != null ? "，与旧模板自相似度 " + d.self_sim : "");
+    st.className = "status-line ok";
+    loadRef(d.ref_url);
+    loadTracking();
+  }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
+  trkReplace = false;
+  inp.value = "";
+}
+async function trkToggle(){
+  const st = $("trk-status");
+  try{
+    const d = await (await fetch("/api/dashboard/tracking")).json();
+    const on = !!d.enabled;
+    await fetch(on ? "/tracking/stop" : "/tracking/start", {method:"POST"});
+    st.textContent = on ? "✓ 已关闭跟踪，头已回到回位角度" : "✓ 已开启跟踪";
+    st.className = "status-line ok";
+    setTimeout(loadTracking, 900);
+  }catch(e){ st.textContent = "✗ " + e.message; st.className = "status-line err"; }
+}
 </script>
 </body>
 </html>

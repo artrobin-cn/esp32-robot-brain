@@ -3,3 +3,5 @@ pyyaml>=6.0
 requests>=2.31
 opencv-python-headless>=4.9
 numpy>=1.26
+edge-tts>=7.3.1  # 7.2.8 及以下会被微软 Sec-MS-GEC DRM 403 拒掉（2026-10-12 起）
+av>=13.0  # TTS mp3 → ogg opus 转码
